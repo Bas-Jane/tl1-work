@@ -1,11 +1,13 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.2.6  
-**TL1 engine:** v2.106.0  
+**Desktop app:** v1.2.7  
+**TL1 engine:** v2.107.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
+
+There is **no GitHub Actions workflow** and no native-build workflow in this package. The repository launches locally with Python.
 
 ## Repository contents
 
@@ -223,7 +225,7 @@ This GitHub launch package bundles the same TL1 processing engine as the standal
 
 - Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
 - GitHub package engine: `tl1_generator/engine.py`
-- Bundled engine version: `2.106.0`
+- Bundled engine version: `2.107.0`
 
 When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
 
@@ -245,7 +247,7 @@ This keeps separate runs isolated and prevents output from different executions 
 
 ## Current engine behavior
 
-Bundled TL1 engine: `v2.106.0`
+Bundled TL1 engine: `v2.107.0`
 
 Recent parser improvements include:
 - section-scoped `Out of Scope` detection so a following section cannot incorrectly suppress the current section;
@@ -253,3 +255,18 @@ Recent parser improvements include:
 - PM File Storage Period (`MEAS-KDAY`) generation from paired `*-day` / `*-hour` parameters when CLI Name cells are blank;
 - `SVC="{all services}"` formatting for Service Overload Control;
 - timestamped output run folders.
+
+
+## Timestamped run folders
+
+Every generation is written into a new execution-time folder created by the TL1 engine itself:
+
+```text
+<selected-output-folder>/
+└── YYYYMMDD_HHMMSS/
+    ├── <stem>_v2_107_0.tl1
+    ├── <stem>_v2_107_0_part002.tl1
+    └── <stem>_v2_107_0.warnings.txt
+```
+
+Both the standalone script and the GitHub GUI use the same engine-level output routing, so neither can bypass the timestamp folder.
