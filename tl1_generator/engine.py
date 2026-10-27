@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.106.0"
+SCRIPT_VERSION = "2.107.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1968,6 +1968,40 @@ def split_text_by_max_lines(text: str, max_lines: int = MAX_TL1_LINES_PER_FILE) 
     return chunks
 
 
+
+def timestamped_run_output_path(output_path: str) -> Path:
+    """Return an output path inside a YYYYMMDD_HHMMSS run folder.
+
+    The caller supplies the desired parent directory and filename. This helper
+    guarantees that generation occurs inside a timestamped child folder:
+
+        <selected-output-folder>/YYYYMMDD_HHMMSS/<filename>
+
+    If the supplied parent is already a timestamp run folder, it is reused.
+    This keeps CLI and GUI behavior identical and prevents accidental double
+    timestamp nesting.
+    """
+    path = Path(output_path)
+    parent = path.parent
+
+    if re.fullmatch(r"\d{8}_\d{6}", parent.name):
+        run_folder = parent
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_folder = parent / timestamp
+
+        # A second execution within the exact same second should not mix files.
+        if run_folder.exists():
+            suffix = 2
+            base = run_folder
+            while run_folder.exists():
+                run_folder = parent / f"{base.name}_{suffix:02d}"
+                suffix += 1
+
+    run_folder.mkdir(parents=True, exist_ok=True)
+    return run_folder / path.name
+
+
 def write_tl1_files(output_path: str, text: str, max_lines: int = MAX_TL1_LINES_PER_FILE) -> List[str]:
     """Write TL1 output, splitting into numbered files when needed.
 
@@ -1978,8 +2012,7 @@ def write_tl1_files(output_path: str, text: str, max_lines: int = MAX_TL1_LINES_
         ...
     and does not create the oversized unsplit file.
     """
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = timestamped_run_output_path(output_path)
 
     chunks = split_text_by_max_lines(text, max_lines=max_lines)
     written: List[str] = []
@@ -1999,21 +2032,15 @@ def write_tl1_files(output_path: str, text: str, max_lines: int = MAX_TL1_LINES_
     return written
 
 def ask_output_path(default_stem: str) -> str:
-    """Choose the parent output folder and create a timestamped run folder.
+    """Choose the parent output folder and desired TL1 filename.
 
-    Every run is isolated in:
-        <selected-output-folder>/<YYYYMMDD_HHMMSS>/
-
-    All TL1 parts and the warnings file are written into that run folder.
+    The timestamped run directory is created centrally by write_tl1_files(), so
+    every caller follows the same output-folder behavior.
     """
     print("Select output folder...")
     folder = choose_folder_dialog()
     if not folder:
         folder = prompt_path("Enter output folder path: ", must_exist=True, is_dir=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_folder = Path(folder) / timestamp
-    run_folder.mkdir(parents=True, exist_ok=True)
 
     name = input(f"Enter output TL1 filename stem [{default_stem}]: ").strip().strip('"')
     if name:
@@ -2021,10 +2048,8 @@ def ask_output_path(default_stem: str) -> str:
     else:
         stem = default_stem
 
-    # The folder already identifies the run timestamp; keep the filename concise
-    # while retaining the engine version.
     filename = f"{stem}_{VERSION_TAG}.tl1"
-    return str(run_folder / filename)
+    return str(Path(folder) / filename)
 
 def ask_sheet_selection(wb_values) -> List[str]:
     print("\nWorkbook sheets:")
@@ -2131,7 +2156,8 @@ def main() -> None:
     print(f"Generated total output lines: {total_lines}")
 
     if warnings:
-        warn_path = str(Path(output_path).with_suffix(".warnings.txt"))
+        actual_output = Path(written_files[0])
+        warn_path = actual_output.with_suffix(".warnings.txt")
         with open(warn_path, "w", encoding="utf-8") as f:
             f.write("\n".join(warnings) + "\n")
         print(f"Warnings written to: {warn_path}")
