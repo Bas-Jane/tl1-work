@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.105.0"
+SCRIPT_VERSION = "2.106.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -496,21 +496,16 @@ def find_section_title(ws_values, cli_row: int) -> str:
 
 
 def is_out_of_scope_section(ws_values, section: Section, next_cli_row: int) -> bool:
-    """Return True when the current CLI section is marked Out of Scope.
+    """Return True when THIS CLI section is marked Out of Scope.
 
-    Detection is intentionally section-scoped: scan from the section title/header
-    area through the CLI body, but stop before the next CLI section.  This avoids
-    accidentally inheriting Out of Scope from a following section.
-
-    Supported layouts include:
-        Review Status | Out of Scope
-        Config Status | Out of Scope
-
-    and merged/header-band variants where the label and value are separated
-    across several columns.
+    Review Status / Config Status are located above the section's CLI Command.
+    Scan only the current section header area ending at section.cli_row.  Do not
+    scan forward toward the next CLI command because the next section's header
+    may start several rows before its CLI row and could otherwise cause a false
+    Out-of-Scope match for the current section.
     """
-    start_row = max(1, section.cli_row - 12)
-    end_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
+    start_row = max(1, section.cli_row - 15)
+    end_row = section.cli_row
 
     for r in range(start_row, end_row + 1):
         row_values_text = [
@@ -537,7 +532,6 @@ def is_out_of_scope_section(ws_values, section: Section, next_cli_row: int) -> b
             return True
 
     return False
-
 
 def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: int) -> Dict[str, str]:
     """Find Parameters table after CLI row and return parameter leaf -> CLI name."""
@@ -1321,9 +1315,99 @@ def records_to_act_lic_tl1(section: Section, records: List[Dict[str, Any]]) -> L
     return [f"ACT-LIC:{','.join(parts)};"]
 
 
+
+def extract_meas_kday_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Build MEAS-KDAY records from paired *-day / *-hour parameters.
+
+    Some PM File Storage Period sections intentionally leave CLI Name blank and
+    encode the command TYPE in the parameter name itself:
+
+        raw-1min-day   -> TYPE=RAW-1MIN, DAYS=<target>
+        raw-1min-hour  -> TYPE=RAW-1MIN, HOURS=<target>
+
+    The same rule applies generically to any <type>-day / <type>-hour pair.
+    """
+    if section.command.upper() != "CHG-MEAS-KDAY":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # Locate PARAMATERS header and its embedded Target Value column.
+    header_row = None
+    param_col = None
+    target_col = None
+
+    for r in range(section.cli_row, min(next_cli_row - 1, ws.max_row) + 1):
+        row_texts = [norm_key(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        if not any(t in {"parameters", "paramaters"} for t in row_texts):
+            continue
+        header_row = r
+        for c in range(1, ws.max_column + 1):
+            raw = as_text(ws.cell(r, c).value)
+            key = norm_key(raw)
+            if key in {"parameters", "paramaters"}:
+                param_col = c
+            elif TARGET_RE.search(raw):
+                target_col = c
+        break
+
+    if header_row is None or param_col is None or target_col is None:
+        return []
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for r in range(header_row + 1, min(next_cli_row - 1, ws.max_row) + 1):
+        param = clean_param(ws.cell(r, param_col).value)
+        if not param:
+            continue
+
+        m = re.fullmatch(r"(.+)-(day|hour)", param.strip(), re.I)
+        if not m:
+            # Once grouped rows have started, unrelated rows are documentation
+            # or the next structure; ignore them rather than inventing output.
+            continue
+
+        type_name = m.group(1)
+        kind = m.group(2).lower()
+        raw_target = ws.cell(r, target_col).value
+
+        if is_metadata_or_helper_value(raw_target):
+            continue
+
+        if type_name not in grouped:
+            grouped[type_name] = {"TYPE": type_name}
+            order.append(type_name)
+
+        grouped[type_name]["DAYS" if kind == "day" else "HOURS"] = raw_target
+
+    if not grouped:
+        return []
+
+    # Direct aliases allow generic record_to_cli_values/render_cli_line reuse.
+    for cli in ("TYPE", "DAYS", "HOURS"):
+        section.param_to_cli.setdefault(cli, cli)
+
+    return [grouped[name] for name in order]
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CHG-MEAS-KDAY":
+        meas_records = extract_meas_kday_records(wb_values, section, sections)
+        if meas_records:
+            return meas_records
 
     known_params = set(section.param_to_cli.keys())
     if not known_params:
