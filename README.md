@@ -1,8 +1,8 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.2.1  
-**TL1 engine:** v2.99.0  
+**Desktop app:** v1.2.4  
+**TL1 engine:** v2.104.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
@@ -216,3 +216,13 @@ python launch.py --reinstall
 ## Repository design
 
 This package deliberately bypasses GitHub workflow automation. GitHub is used only as the source repository. Setup and launch happen on the user's own Windows, macOS, or Linux machine.
+
+## Version synchronization
+
+This GitHub launch package bundles the same TL1 processing engine as the standalone/local script.
+
+- Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
+- GitHub package engine: `tl1_generator/engine.py`
+- Bundled engine version: `2.104.0`
+
+When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
