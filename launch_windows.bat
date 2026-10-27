@@ -11,7 +11,7 @@ if %errorlevel%==0 (
 
 if errorlevel 1 (
     echo.
-    echo Tools TL1 Generator did not start successfully.
+    echo TL1 Generator did not start successfully.
     echo Review the message above, then press any key to close.
     pause >nul
 )
