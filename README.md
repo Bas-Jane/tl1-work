@@ -7,8 +7,6 @@
 
 Tools TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
 
-There is **no GitHub Actions workflow** and no native-build workflow in this package. The repository launches locally with Python.
-
 ## Repository contents
 
 ```text
@@ -26,8 +24,6 @@ Tools_TL1_Generator/
 ├── .gitignore
 └── README.md
 ```
-
-That is the complete launch repository. No `.github/workflows`, build scripts, PyInstaller files, or installer scripts are required.
 
 ## Requirements
 
