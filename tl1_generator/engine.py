@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.107.0"
+SCRIPT_VERSION = "2.108.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1831,6 +1831,28 @@ def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     cli_values = record_to_cli_values(section, record, keep_arrows=False)
     row_action = normalize_row_action(record.get("__ROW_ACTION__"))
     command = derive_command_for_row(section.command, row_action)
+    command_upper = command.upper()
+
+    # Skip Service Overload Control entries that target the synthetic
+    # "{all services}" selector.
+    if command_upper == "CHG-OVLD-CNTL":
+        svc = cli_values.get("SVC", "")
+        if svc.strip().strip('"').lower() == "{all services}":
+            return None
+
+    # Skip VES control entries when EVENT is the synthetic ALL selector.
+    if command_upper == "CHG-VES-CNTL":
+        event = cli_values.get("EVENT", "")
+        if event.strip().strip('"').upper() == "{ALL}":
+            return None
+
+    # MEAS-KDAY TL1 expects TYPE without the RAW- prefix.
+    # RAW-1MIN -> 1MIN, RAW-5MIN -> 5MIN, RAW-HOUR -> HOUR, etc.
+    if command_upper == "CHG-MEAS-KDAY" and "TYPE" in cli_values:
+        type_value = cli_values["TYPE"]
+        if type_value.upper().startswith("RAW-"):
+            cli_values["TYPE"] = type_value[4:]
+
     return render_cli_line(command, section.cli_order, cli_values)
 
 
@@ -2002,6 +2024,18 @@ def timestamped_run_output_path(output_path: str) -> Path:
     return run_folder / path.name
 
 
+
+def write_warnings_file(written_files: Sequence[str], warnings: Sequence[str]) -> Optional[str]:
+    """Write warnings beside the actual TL1 output inside the run timestamp folder."""
+    if not warnings or not written_files:
+        return None
+
+    first_output = Path(written_files[0])
+    warn_path = first_output.with_suffix(".warnings.txt")
+    warn_path.write_text("\n".join(warnings) + "\n", encoding="utf-8")
+    return str(warn_path)
+
+
 def write_tl1_files(output_path: str, text: str, max_lines: int = MAX_TL1_LINES_PER_FILE) -> List[str]:
     """Write TL1 output, splitting into numbered files when needed.
 
@@ -2155,11 +2189,8 @@ def main() -> None:
     print(f"Generated TL1 command lines: {line_count}")
     print(f"Generated total output lines: {total_lines}")
 
-    if warnings:
-        actual_output = Path(written_files[0])
-        warn_path = actual_output.with_suffix(".warnings.txt")
-        with open(warn_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(warnings) + "\n")
+    warn_path = write_warnings_file(written_files, warnings)
+    if warn_path:
         print(f"Warnings written to: {warn_path}")
 
 
