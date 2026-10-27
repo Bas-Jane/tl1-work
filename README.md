@@ -1,16 +1,16 @@
-# Tools TL1 Generator
+# TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.2.0  
+**Desktop app:** v1.2.1  
 **TL1 engine:** v2.99.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
-Tools TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
+TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
 
 ## Repository contents
 
 ```text
-Tools_TL1_Generator/
+TL1_Generator/
 ├── tl1_generator/
 │   ├── __init__.py
 │   ├── __main__.py
@@ -24,6 +24,8 @@ Tools_TL1_Generator/
 ├── .gitignore
 └── README.md
 ```
+
+That is the complete launch repository. No `.github/workflows`, build scripts, PyInstaller files, or installer scripts are required.
 
 ## Requirements
 
@@ -100,7 +102,7 @@ On the first launch it automatically:
 2. Finds Python 3.10+.
 3. Creates a repository-local `.venv`.
 4. Installs dependencies from `requirements.txt`.
-5. Starts the Tools TL1 Generator desktop GUI.
+5. Starts the TL1 Generator desktop GUI.
 
 On later launches it reuses `.venv`. Dependencies are reinstalled only if `requirements.txt` changes or `--reinstall` is supplied.
 
@@ -146,7 +148,7 @@ If local changes are present, the launcher skips the pull rather than overwritin
 
 ## Normal application workflow
 
-1. Launch Tools TL1 Generator.
+1. Launch TL1 Generator.
 2. Select the CIQ `.xlsx` or `.xlsm` workbook.
 3. Load the workbook.
 4. Select one or more sheets.
