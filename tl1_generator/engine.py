@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.108.0"
+SCRIPT_VERSION = "2.110.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -62,6 +62,7 @@ class Section:
     command: str
     cli_order: List[str]
     param_to_cli: Dict[str, str]
+    key_cli_names: Optional[set[str]] = None
 
 
 # -----------------------------
@@ -533,6 +534,109 @@ def is_out_of_scope_section(ws_values, section: Section, next_cli_row: int) -> b
 
     return False
 
+
+def is_default_wrapped_value(value: Any) -> bool:
+    """True only for a complete CIQ default wrapper such as [default = 24000]."""
+    if value is None:
+        return False
+    text = as_text(value).strip()
+    return bool(re.fullmatch(r"\[\s*default\s*=\s*[^\]]+\]", text, flags=re.I))
+
+
+def find_key_cli_names(
+    ws_values,
+    cli_row: int,
+    next_cli_row: int,
+) -> set[str]:
+    """Return CLI names whose parameter Type is a key leaf.
+
+    Supports values such as:
+        key leaf
+        child list key leaf
+        child-list key leaf
+    """
+    max_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
+    header_row = None
+
+    for r in range(cli_row, max_row + 1):
+        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        if any(t in {"parameters", "paramaters"} for t in texts):
+            header_row = r
+            break
+
+    if header_row is None:
+        return set()
+
+    type_col = None
+    cli_col = None
+    for c in range(1, ws_values.max_column + 1):
+        key = norm_key(ws_values.cell(header_row, c).value)
+        if key == "type":
+            type_col = c
+        elif key == "cli name":
+            cli_col = c
+
+    if type_col is None or cli_col is None:
+        return set()
+
+    keys: set[str] = set()
+    for r in range(header_row + 1, max_row + 1):
+        row_text = " | ".join(
+            as_text(ws_values.cell(r, c).value)
+            for c in range(1, ws_values.max_column + 1)
+        )
+        if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+            break
+
+        type_text = norm_key(ws_values.cell(r, type_col).value)
+        cli_name = clean_cli_name(ws_values.cell(r, cli_col).value)
+        if cli_name and "key leaf" in type_text:
+            keys.add(cli_name)
+
+    return keys
+
+
+def record_has_only_default_non_key_values(section: Section, record: Dict[str, Any]) -> bool:
+    """Return True when every assigned non-key parameter is [default = ...].
+
+    Key fields identify the configuration instance and do not prevent skipping.
+    Blank/status/arrow/control fields are ignored. At least one non-key assigned
+    parameter must exist, and every such parameter must be a complete default
+    wrapper.
+
+    This is generic across all commands.
+    """
+    key_cli_names = {x.upper() for x in (section.key_cli_names or set())}
+    non_key_raw_values: List[Any] = []
+
+    for param, raw_value in record.items():
+        if str(param).startswith("__"):
+            continue
+
+        cli_name = section.param_to_cli.get(param)
+        if not cli_name:
+            # Direct CLI-name records used by special parsers.
+            candidate = clean_cli_name(param)
+            if candidate in {x.upper() for x in section.cli_order}:
+                cli_name = candidate
+
+        if not cli_name:
+            continue
+
+        cli_upper = cli_name.upper()
+        if cli_upper in key_cli_names:
+            continue
+
+        if raw_value is None or is_blank(raw_value) or is_status(raw_value) or is_arrow_value(raw_value):
+            continue
+
+        non_key_raw_values.append(raw_value)
+
+    return bool(non_key_raw_values) and all(
+        is_default_wrapped_value(v) for v in non_key_raw_values
+    )
+
+
 def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: int) -> Dict[str, str]:
     """Find Parameters table after CLI row and return parameter leaf -> CLI name."""
     max_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
@@ -626,6 +730,7 @@ def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]
             command, cli_order = parse_cli(raw)
             title = find_section_title(ws, r)
             mapping = find_parameter_mapping(ws, r, c, next_cli_row)
+            key_cli_names = find_key_cli_names(ws, r, next_cli_row)
             # Keep the explicit CLI Name column as the source of truth.
             # Earlier versions inferred CLI names from the YANG leaf suffix for every row,
             # but that broke valid child-list mappings such as:
@@ -655,6 +760,7 @@ def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]
                     command=command,
                     cli_order=cli_order,
                     param_to_cli=mapping,
+                    key_cli_names=key_cli_names,
                 )
             )
     return sections
@@ -932,6 +1038,40 @@ def row_starts_documentation_block(ws_values, row: int, scan_cols: Optional[Sequ
     return False
 
 
+
+def row_starts_next_section_header(
+    ws_values,
+    row: int,
+    scan_cols: Optional[Sequence[int]] = None,
+) -> bool:
+    """Detect the header/status rows of the following CIQ section.
+
+    A new section title often appears several rows before its CLI Command, so
+    limiting parsing only by the next CLI row is not enough. Review Status and
+    Config Status rows after target records have begun mark the end of the
+    current target table.
+    """
+    if scan_cols is None:
+        scan_cols = range(1, ws_values.max_column + 1)
+
+    vals = [
+        re.sub(r"\s+", " ", as_text(ws_values.cell(row, c).value)).strip().lower()
+        for c in scan_cols
+        if as_text(ws_values.cell(row, c).value)
+    ]
+    if not vals:
+        return False
+
+    joined = " | ".join(vals)
+    return (
+        "review status" in joined
+        or "config status" in joined
+        or any(v.startswith("yang path:") for v in vals)
+        or any(v.startswith("cli command:") for v in vals)
+    )
+
+
+
 def parse_horizontal_targets(
     ws_values,
     marker_row: int,
@@ -980,8 +1120,12 @@ def parse_horizontal_targets(
         if CURRENT_RE.search(marker_text):
             break
 
-        # Stop before post-target documentation/reference tables.
-        if records and row_starts_documentation_block(ws_values, r, watch_cols):
+        # Stop before post-target documentation/reference tables or the next
+        # CIQ section header, which may appear before the next CLI Command row.
+        if records and (
+            row_starts_documentation_block(ws_values, r, watch_cols)
+            or row_starts_next_section_header(ws_values, r, watch_cols)
+        ):
             break
 
         rec: Dict[str, Any] = {}
@@ -1825,9 +1969,12 @@ def records_to_mmertal_tl1(section: Section, records: List[Dict[str, Any]]) -> L
 def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     """Convert one target record into one TL1 command line.
 
-    If the target row contains an action marker such as CHG, override the
-    section command prefix for that row while preserving the command object.
+    If every assigned non-key value is a CIQ [default = ...] wrapper, skip the
+    configuration entirely. Explicit key values may still be present.
     """
+    if record_has_only_default_non_key_values(section, record):
+        return None
+
     cli_values = record_to_cli_values(section, record, keep_arrows=False)
     row_action = normalize_row_action(record.get("__ROW_ACTION__"))
     command = derive_command_for_row(section.command, row_action)
@@ -1885,7 +2032,20 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         if getattr(ws_for_size, "max_row", 0) and ws_for_size.max_row >= LARGE_SHEET_ROW_THRESHOLD:
             print(f"Processing large sheet '{section.sheet_name}' with {ws_for_size.max_row:,} rows, section #{idx}: {section.title}")
 
-        records = extract_target_records_for_section(wb_values, section, sections)
+        extracted_records = extract_target_records_for_section(wb_values, section, sections)
+
+        # Generic default-only filtering must also apply to special renderers
+        # (NE-GRP, peer service entries, MMERTAL, ACT-LIC, etc.) that do not
+        # route through record_to_tl1().
+        default_only_count = sum(
+            1 for rec in extracted_records
+            if record_has_only_default_non_key_values(section, rec)
+        )
+        records = [
+            rec for rec in extracted_records
+            if not record_has_only_default_non_key_values(section, rec)
+        ]
+
         if len(records) >= 50000:
             print(f"  Rendering {len(records):,} TL1 candidate records for section #{idx}: {section.title}")
 
@@ -1909,8 +2069,24 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         if lines:
             block = [f"### {section.title}"] + lines
             output_blocks.append("\n".join(block))
+            if default_only_count:
+                warnings.append(
+                    f"Skipped {default_only_count} default-only configuration row(s) "
+                    f"for section #{idx}: {section.title} "
+                    f"[{section.sheet_name} row {section.cli_row}]"
+                )
         else:
-            warnings.append(f"No TL1 rows generated for section #{idx}: {section.title} [{section.sheet_name} row {section.cli_row}]")
+            if extracted_records and default_only_count == len(extracted_records):
+                warnings.append(
+                    f"Skipped default-only section #{idx}: {section.title} "
+                    f"({default_only_count} row(s)) "
+                    f"[{section.sheet_name} row {section.cli_row}]"
+                )
+            else:
+                warnings.append(
+                    f"No TL1 rows generated for section #{idx}: {section.title} "
+                    f"[{section.sheet_name} row {section.cli_row}]"
+                )
 
     return "\n\n".join(output_blocks).rstrip() + "\n", warnings
 
