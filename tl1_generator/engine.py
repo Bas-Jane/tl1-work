@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.102.0"
+SCRIPT_VERSION = "2.104.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -349,6 +349,17 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
+
+    # CHG-DIAG-INF MSG normalization.
+    # These source values are YANG-style strings but TL1 expects short codes:
+    #   status-inhibit -> INH
+    #   status-allow   -> ALW
+    if cmd == "CHG-DIAG-INF" and cli == "MSG":
+        normalized = value.strip().lower()
+        if normalized == "status-inhibit":
+            return "INH"
+        if normalized == "status-allow":
+            return "ALW"
 
     # RTALIDX can be entered as "1 | 2", "1|2", "1 / 2", "1, 2", etc.
     # TL1 expects ampersand-separated values, especially for CHG-MMECALL-PROF:
@@ -875,6 +886,52 @@ def detect_row_action_near_target_columns(
     return None
 
 
+
+def row_starts_documentation_block(ws_values, row: int, scan_cols: Optional[Sequence[int]] = None) -> bool:
+    """Detect detail/reference tables that follow a real Target Values table.
+
+    CIQ sheets commonly append documentation blocks after configuration rows:
+      Resource Details | Details hidden
+      Call Timer Details | ...
+      License Details | ...
+      Resources (...) | Description
+
+    These are not configuration records and must terminate target parsing.
+    """
+    if scan_cols is None:
+        scan_cols = range(1, ws_values.max_column + 1)
+
+    vals = [
+        re.sub(r"\s+", " ", as_text(ws_values.cell(row, c).value)).strip().lower()
+        for c in scan_cols
+        if as_text(ws_values.cell(row, c).value)
+    ]
+    if not vals:
+        return False
+
+    joined = " | ".join(vals)
+
+    strong_markers = (
+        "resource details",
+        "details hidden",
+        "call timer details",
+        "license details",
+        "timer details",
+    )
+    if any(marker in joined for marker in strong_markers):
+        return True
+
+    # Generic reference/detail-table header after target rows.
+    if any(v == "description" for v in vals):
+        if any(
+            ("resource" in v or "timer" in v or "item" == v or "value range" in v)
+            for v in vals
+        ):
+            return True
+
+    return False
+
+
 def parse_horizontal_targets(
     ws_values,
     marker_row: int,
@@ -923,6 +980,10 @@ def parse_horizontal_targets(
         if CURRENT_RE.search(marker_text):
             break
 
+        # Stop before post-target documentation/reference tables.
+        if records and row_starts_documentation_block(ws_values, r, watch_cols):
+            break
+
         rec: Dict[str, Any] = {}
         has_any_value = False
         for c, p in param_cols.items():
@@ -942,7 +1003,12 @@ def parse_horizontal_targets(
 
         if has_any_value:
             if record_contains_metadata_row(rec):
-                # Do not treat section header/status/config rows as target rows.
+                # Once real target rows have started, a metadata/details row
+                # marks the end of the target table. Stop parsing so following
+                # documentation rows (Resource Details, descriptions, timer
+                # details, etc.) cannot become TL1 commands.
+                if records:
+                    break
                 continue
             blank_run = 0
             records.append(rec)
@@ -1332,6 +1398,12 @@ def is_metadata_or_helper_value(value: Any) -> bool:
         "current values",
         "type",
         "mandatory",
+        "details hidden",
+        "resource details",
+        "call timer details",
+        "license details",
+        "value range",
+        "recommended",
     }
     if low in exact_bad:
         return True
@@ -1344,6 +1416,10 @@ def is_metadata_or_helper_value(value: Any) -> bool:
         "target values ",
         "current value ",
         "current values ",
+        "resource details",
+        "call timer details",
+        "license details",
+        "details hidden",
     )
     if low.startswith(bad_prefixes):
         return True
