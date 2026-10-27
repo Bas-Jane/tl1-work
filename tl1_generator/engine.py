@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.104.0"
+SCRIPT_VERSION = "2.105.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -349,6 +349,12 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
+
+    # CHG-FD-LMT value normalization.
+    # The service/container name "istio-proxy" is case-sensitive and must remain
+    # lowercase instead of being converted to ISTIO-PROXY.
+    if cmd == "CHG-FD-LMT" and value.strip().lower() == "istio-proxy":
+        return "istio-proxy"
 
     # CHG-DIAG-INF MSG normalization.
     # These source values are YANG-style strings but TL1 expects short codes:
@@ -1909,21 +1915,32 @@ def write_tl1_files(output_path: str, text: str, max_lines: int = MAX_TL1_LINES_
     return written
 
 def ask_output_path(default_stem: str) -> str:
+    """Choose the parent output folder and create a timestamped run folder.
+
+    Every run is isolated in:
+        <selected-output-folder>/<YYYYMMDD_HHMMSS>/
+
+    All TL1 parts and the warnings file are written into that run folder.
+    """
     print("Select output folder...")
     folder = choose_folder_dialog()
     if not folder:
         folder = prompt_path("Enter output folder path: ", must_exist=True, is_dir=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    default_name = f"{default_stem}_{VERSION_TAG}_{timestamp}.tl1"
-    name = input(f"Enter output TL1 filename stem [{default_stem}]: ").strip().strip('"')
-    if not name:
-        name = default_name
-    else:
-        stem = Path(name).stem if name.lower().endswith(".tl1") else name
-        name = f"{stem}_{VERSION_TAG}_{timestamp}.tl1"
-    return str(Path(folder) / name)
+    run_folder = Path(folder) / timestamp
+    run_folder.mkdir(parents=True, exist_ok=True)
 
+    name = input(f"Enter output TL1 filename stem [{default_stem}]: ").strip().strip('"')
+    if name:
+        stem = Path(name).stem if name.lower().endswith(".tl1") else name
+    else:
+        stem = default_stem
+
+    # The folder already identifies the run timestamp; keep the filename concise
+    # while retaining the engine version.
+    filename = f"{stem}_{VERSION_TAG}.tl1"
+    return str(run_folder / filename)
 
 def ask_sheet_selection(wb_values) -> List[str]:
     print("\nWorkbook sheets:")
