@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.99.0"
+SCRIPT_VERSION = "2.102.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -97,6 +97,23 @@ def clean_param(value: Any) -> str:
     s = re.sub(r"\s*/\s*", "/", s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+
+def is_placeholder_param(value: Any) -> bool:
+    """Return True when the Parameter/YANG cell is only a placeholder.
+
+    CIQ sections sometimes use "-", "--", "N/A", or "None" instead of a real
+    parameter name. Such values must not be used as mapping keys because several
+    rows can share the same placeholder and overwrite each other.
+    """
+    text = clean_param(value).strip()
+    normalized = text.lower()
+    if not text:
+        return True
+    if re.fullmatch(r"-+", text):
+        return True
+    return normalized in {"n/a", "na", "none", "null", "[none]"}
 
 
 def infer_cli_from_param(param: str, cli_order: Sequence[str]) -> Optional[str]:
@@ -383,27 +400,15 @@ def row_values(ws, row: int, start_col: int = 1, end_col: Optional[int] = None) 
 # -----------------------------
 
 def extract_fixed_cli_values(raw_cli_text: str) -> Dict[str, str]:
-    """Extract fixed KEY=VALUE assignments from a CLI Command template.
-
-    Examples:
-        CHG-MMECALL-TMR:TYPE=PAGE,TID,[VAL],[RETRY];
-            -> {"TYPE": "PAGE"}
-
-        CHG-LOG-LMT:TYPE,[LMT],[MINDAY],[MAXDAY]; (TYPE=UI)
-            -> {"TYPE": "UI"}
-
-    Fixed assignments are inserted into every generated command line and take
-    precedence over target-table values for the same CLI field.
-    """
+    """Extract fixed KEY=VALUE assignments from a CLI Command template."""
     m = CLI_RE.search(raw_cli_text)
     cli = m.group(1).strip() if m else raw_cli_text.strip()
 
     fixed: Dict[str, str] = {}
-
-    # Main command portion before the first semicolon.
     command_part, sep, suffix = cli.partition(";")
+
     if ":" in command_part:
-        _cmd, rest = command_part.split(":", 1)
+        command_name, rest = command_part.split(":", 1)
         for part in rest.split(","):
             token = part.strip().strip("[]")
             if "=" not in token:
@@ -412,15 +417,17 @@ def extract_fixed_cli_values(raw_cli_text: str) -> Dict[str, str]:
             key = clean_cli_name(key)
             value = as_text(value).strip().strip('"').strip("'")
             if key and value:
-                fixed[key] = format_tl1_value(key, value, _cmd.strip())
+                fixed[key] = format_tl1_value(key, value, command_name.strip())
 
-    # Some CIQ templates place a fixed assignment after the semicolon, e.g.
-    #   ; (TYPE=UI)
     if sep and suffix:
-        for key, value in re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)\s*=\s*([A-Za-z0-9_.\-']+)", suffix):
+        command_name = command_part.split(":", 1)[0].strip()
+        for key, value in re.findall(
+            r"\b([A-Za-z][A-Za-z0-9_]*)\s*=\s*([A-Za-z0-9_.\-']+)",
+            suffix,
+        ):
             cli_key = clean_cli_name(key)
             if cli_key:
-                fixed[cli_key] = format_tl1_value(cli_key, value, command_part.split(":", 1)[0].strip())
+                fixed[cli_key] = format_tl1_value(cli_key, value, command_name)
 
     return fixed
 
@@ -428,16 +435,13 @@ def extract_fixed_cli_values(raw_cli_text: str) -> Dict[str, str]:
 def parse_cli(raw_cli_text: str) -> Tuple[str, List[str]]:
     """Parse a CLI template into command name and ordered CLI field names.
 
-    Fixed assignments such as TYPE=PAGE are represented in cli_order as TYPE,
-    while their fixed value is separately recovered by extract_fixed_cli_values().
+    Fixed assignments such as TYPE=PAGE are represented in cli_order as TYPE.
     """
     m = CLI_RE.search(raw_cli_text)
     cli = m.group(1).strip() if m else raw_cli_text.strip()
     cli = cli.rstrip()
 
-    # Only parse the actual command portion before any explanatory suffix.
     command_part = cli.split(";", 1)[0].strip()
-
     if ":" not in command_part:
         return command_part.rstrip(";").upper(), []
 
@@ -447,11 +451,8 @@ def parse_cli(raw_cli_text: str) -> Tuple[str, List[str]]:
         token = part.strip().strip("[]")
         if not token:
             continue
-
-        # TYPE=PAGE -> TYPE
         if "=" in token:
             token = token.split("=", 1)[0].strip()
-
         name = clean_cli_name(token)
         if name and name not in parts:
             parts.append(name)
@@ -474,6 +475,51 @@ def find_section_title(ws_values, cli_row: int) -> str:
             if not best and len(text) > 2:
                 best = text
     return best or ws_values.title
+
+
+
+def is_out_of_scope_section(ws_values, section: Section, next_cli_row: int) -> bool:
+    """Return True when the current CLI section is marked Out of Scope.
+
+    Detection is intentionally section-scoped: scan from the section title/header
+    area through the CLI body, but stop before the next CLI section.  This avoids
+    accidentally inheriting Out of Scope from a following section.
+
+    Supported layouts include:
+        Review Status | Out of Scope
+        Config Status | Out of Scope
+
+    and merged/header-band variants where the label and value are separated
+    across several columns.
+    """
+    start_row = max(1, section.cli_row - 12)
+    end_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
+
+    for r in range(start_row, end_row + 1):
+        row_values_text = [
+            as_text(ws_values.cell(r, c).value)
+            for c in range(1, ws_values.max_column + 1)
+        ]
+        row_norm = [re.sub(r"\s+", " ", v).strip().lower() for v in row_values_text if v]
+
+        if not row_norm:
+            continue
+
+        has_status_label = any(
+            v in {"review status", "config status"} or
+            v.startswith("review status") or
+            v.startswith("config status")
+            for v in row_norm
+        )
+        has_out_of_scope = any(
+            v == "out of scope" or "out of scope" in v
+            for v in row_norm
+        )
+
+        if has_status_label and has_out_of_scope:
+            return True
+
+    return False
 
 
 def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: int) -> Dict[str, str]:
@@ -512,6 +558,12 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
 
         param = clean_param(ws_values.cell(r, param_col).value)
         cli_name = clean_cli_name(ws_values.cell(r, cli_name_col).value)
+
+        # Placeholder Parameter values such as "-" are not real parameter
+        # names. Do not use them as mapping keys or later rows will overwrite
+        # earlier rows that use the same placeholder.
+        if is_placeholder_param(param):
+            param = ""
 
         # Normal mapping: YANG/CIQ parameter path -> CLI Name.
         if param and cli_name:
@@ -1045,6 +1097,8 @@ def parse_embedded_parameter_target_values(
 
         cli_name = clean_cli_name(ws_values.cell(r, cli_col).value)
         param = clean_param(ws_values.cell(r, param_col).value) if param_col else ""
+        if is_placeholder_param(param):
+            param = ""
         raw_target = ws_values.cell(r, target_col).value
 
         if not cli_name and not param and is_blank(raw_target):
@@ -1090,7 +1144,115 @@ def parse_embedded_parameter_target_values(
     return [record]
 
 
+
+def extract_act_lic_record(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract ACT-LIC information/signature target values.
+
+    ACT-LIC uses labeled target rows instead of a normal horizontal/vertical
+    target table, e.g.:
+        Target Value (...) (information) | SN=...
+        Target Value (...) (signature)   | MCw...
+    """
+    if section.command.upper() != "ACT-LIC":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    information = None
+    signature = None
+
+    for r in range(section.cli_row, min(next_cli_row - 1, ws.max_row) + 1):
+        for c in range(1, ws.max_column + 1):
+            label = as_text(ws.cell(r, c).value)
+            if not label:
+                continue
+
+            low = re.sub(r"\s+", " ", label).strip().lower()
+            if not TARGET_RE.search(label):
+                continue
+
+            is_info = "information" in low
+            is_sig = "signature" in low
+            if not (is_info or is_sig):
+                continue
+
+            # Value is normally in the next non-empty cell on the same row.
+            value = None
+            for vc in range(c + 1, ws.max_column + 1):
+                candidate = ws.cell(r, vc).value
+                if candidate is None or as_text(candidate) == "":
+                    continue
+                candidate_text = as_text(candidate)
+                # Do not accidentally consume another label/status cell.
+                if is_metadata_or_helper_value(candidate_text):
+                    continue
+                value = candidate_text
+                break
+
+            if value is None:
+                continue
+
+            if is_info and information is None:
+                information = value
+            elif is_sig and signature is None:
+                signature = value
+
+        if information is not None and signature is not None:
+            break
+
+    if information is None and signature is None:
+        return []
+
+    record: Dict[str, Any] = {}
+    if information is not None:
+        record["__ACT_LIC_INF__"] = information
+    if signature is not None:
+        record["__ACT_LIC_SIG__"] = signature
+    return [record]
+
+
+def quote_tl1_exact(value: Any) -> str:
+    """Wrap a value in double quotes while otherwise preserving it exactly."""
+    text = as_text(value)
+    # Preserve embedded quotes safely for TL1 output.
+    text = text.replace('"', '\\"')
+    return f'"{text}"'
+
+
+def records_to_act_lic_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render ACT-LIC as one exact-case INF/SIG command."""
+    if section.command.upper() != "ACT-LIC" or not records:
+        return []
+
+    record = records[0]
+    inf = record.get("__ACT_LIC_INF__")
+    sig = record.get("__ACT_LIC_SIG__")
+
+    parts: List[str] = []
+    if inf is not None and as_text(inf) != "":
+        parts.append(f"INF={quote_tl1_exact(inf)}")
+    if sig is not None and as_text(sig) != "":
+        parts.append(f"SIG={quote_tl1_exact(sig)}")
+
+    if not parts:
+        return []
+
+    return [f"ACT-LIC:{','.join(parts)};"]
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
+    if section.command.upper() == "ACT-LIC":
+        return extract_act_lic_record(wb_values, section, sections)
+
     known_params = set(section.param_to_cli.keys())
     if not known_params:
         return []
@@ -1237,10 +1399,6 @@ def record_to_cli_values(section: Section, record: Dict[str, Any], *, keep_arrow
             formatted = normalize_ne_type(formatted)
         cli_values[cli_name] = formatted
 
-    # Fixed assignments from the CLI Command template must be present on every
-    # generated row and take precedence over target-table data.
-    # Example: CHG-MMECALL-TMR:TYPE=PAGE,TID,[VAL],[RETRY];
-    #          -> TYPE=PAGE is retained for every timer row.
     fixed_values = extract_fixed_cli_values(section.raw_cli)
     for fixed_name, fixed_value in fixed_values.items():
         cli_values[fixed_name] = fixed_value
@@ -1520,6 +1678,22 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
             continue
 
         ws_for_size = wb_values[section.sheet_name]
+
+        next_cli_row = min(
+            [s.cli_row for s in sections
+             if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+            or [ws_for_size.max_row + 1]
+        )
+
+        # Skip the entire section before parsing any target values when either
+        # Review Status or Config Status says Out of Scope.
+        if is_out_of_scope_section(ws_for_size, section, next_cli_row):
+            warnings.append(
+                f"Skipped Out of Scope section #{idx}: {section.title} "
+                f"[{section.sheet_name} row {section.cli_row}]"
+            )
+            continue
+
         if getattr(ws_for_size, "max_row", 0) and ws_for_size.max_row >= LARGE_SHEET_ROW_THRESHOLD:
             print(f"Processing large sheet '{section.sheet_name}' with {ws_for_size.max_row:,} rows, section #{idx}: {section.title}")
 
@@ -1527,7 +1701,9 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         if len(records) >= 50000:
             print(f"  Rendering {len(records):,} TL1 candidate records for section #{idx}: {section.title}")
 
-        if section.command.upper() == "CRTE-NE-GRP":
+        if section.command.upper() == "ACT-LIC":
+            lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-NE-GRP":
             lines = records_to_ne_grp_tl1(section, records)
         elif section.command.upper() == "CRTE-MMERTAL":
             lines = records_to_mmertal_tl1(section, records)
