@@ -24,7 +24,7 @@ class TL1GeneratorApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title(f"Tools TL1 Generator v{APP_VERSION}")
+        self.title(f"TL1 Generator v{APP_VERSION}")
         self.geometry("1120x760")
         self.minsize(980, 680)
 
@@ -69,7 +69,7 @@ class TL1GeneratorApp(tk.Tk):
         top = ttk.Frame(self, padding=(16, 14, 16, 8))
         top.pack(fill="x")
 
-        title = ttk.Label(top, text="Tools TL1 Generator", font=("Arial", 20, "bold"))
+        title = ttk.Label(top, text="TL1 Generator", font=("Arial", 20, "bold"))
         title.pack(anchor="w")
         subtitle = ttk.Label(
             top,
@@ -219,7 +219,7 @@ class TL1GeneratorApp(tk.Tk):
     def show_about(self) -> None:
         messagebox.showinfo(
             "About",
-            f"Tools TL1 Generator v{APP_VERSION}\n"
+            f"TL1 Generator v{APP_VERSION}\n"
             f"Bundled TL1 engine v{ENGINE_VERSION}\n\n"
             "Converts CIQ Excel Target Values into TL1 command files.\n"
             "Supports multi-sheet workbooks, section selection, warnings, and output splitting.",
