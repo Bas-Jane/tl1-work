@@ -1,8 +1,8 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.2.4  
-**TL1 engine:** v2.104.0  
+**Desktop app:** v1.2.6  
+**TL1 engine:** v2.106.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
@@ -223,6 +223,33 @@ This GitHub launch package bundles the same TL1 processing engine as the standal
 
 - Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
 - GitHub package engine: `tl1_generator/engine.py`
-- Bundled engine version: `2.104.0`
+- Bundled engine version: `2.106.0`
 
 When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
+
+
+## Output folders
+
+Each generation creates a new timestamped run folder under the selected output directory:
+
+```text
+<output-folder>/
+└── YYYYMMDD_HHMMSS/
+    ├── <stem>_v2_105_0.tl1
+    ├── <stem>_v2_105_0_part002.tl1   # when splitting is required
+    └── <stem>_v2_105_0.warnings.txt  # when warnings exist
+```
+
+This keeps separate runs isolated and prevents output from different executions from being mixed together.
+
+
+## Current engine behavior
+
+Bundled TL1 engine: `v2.106.0`
+
+Recent parser improvements include:
+- section-scoped `Out of Scope` detection so a following section cannot incorrectly suppress the current section;
+- CLOG target rows stop before `CLOG Event Details` / `Details hidden` documentation tables;
+- PM File Storage Period (`MEAS-KDAY`) generation from paired `*-day` / `*-hour` parameters when CLI Name cells are blank;
+- `SVC="{all services}"` formatting for Service Overload Control;
+- timestamped output run folders.
