@@ -1,13 +1,11 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.2.8  
-**TL1 engine:** v2.108.0  
+**Desktop app:** v1.2.9  
+**TL1 engine:** v2.110.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
-
-There is **no GitHub Actions workflow** and no native-build workflow in this package. The repository launches locally with Python.
 
 ## Repository contents
 
@@ -225,7 +223,7 @@ This GitHub launch package bundles the same TL1 processing engine as the standal
 
 - Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
 - GitHub package engine: `tl1_generator/engine.py`
-- Bundled engine version: `2.108.0`
+- Bundled engine version: `2.110.0`
 
 When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
 
@@ -247,7 +245,7 @@ This keeps separate runs isolated and prevents output from different executions 
 
 ## Current engine behavior
 
-Bundled TL1 engine: `v2.108.0`
+Bundled TL1 engine: `v2.110.0`
 
 Recent parser improvements include:
 - section-scoped `Out of Scope` detection so a following section cannot incorrectly suppress the current section;
@@ -272,9 +270,30 @@ Every generation is written into a new execution-time folder created by the TL1 
 Both the standalone script and the GitHub GUI use the same engine-level output routing, so neither can bypass the timestamp folder.
 
 
-## Engine v2.108.0 rules
+## Engine v2.110.0 rules
 
 - `CHG-OVLD-CNTL` rows with `SVC="{all services}"` are skipped.
 - `CHG-VES-CNTL` rows with `EVENT={ALL}` are skipped.
 - `CHG-MEAS-KDAY` removes the `RAW-` prefix from `TYPE`, for example `RAW-5MIN -> 5MIN`.
 - TL1 files and warnings are written into the same timestamped execution folder.
+
+
+## Engine v2.110.0 default-only rule
+
+The generator skips a configuration record when every assigned **non-key**
+parameter is expressed as a CIQ default wrapper such as:
+
+```text
+[default = 24000]
+[default = 95]
+[default = status-allow]
+```
+
+Explicit key fields such as service names, fault codes, or type identifiers do
+not prevent the skip. This rule is generic and applies to all commands.
+
+Intentional default-only skips are reported as `Skipped default-only ...`
+rather than `No TL1 rows generated`.
+
+The parser also stops at the next CIQ section header so status text such as
+`Complete` cannot leak into the previous section's TL1 output.
