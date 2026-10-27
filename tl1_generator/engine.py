@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.110.0"
+SCRIPT_VERSION = "2.111.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -2025,6 +2025,14 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         if is_out_of_scope_section(ws_for_size, section, next_cli_row):
             warnings.append(
                 f"Skipped Out of Scope section #{idx}: {section.title} "
+                f"[{section.sheet_name} row {section.cli_row}]"
+            )
+            continue
+
+        # MEAS-KDAY is intentionally excluded from TL1 generation.
+        if section.command.upper() == "CHG-MEAS-KDAY" or "MEAS-KDAY" in section.title.upper():
+            warnings.append(
+                f"Skipped MEAS-KDAY section #{idx}: {section.title} "
                 f"[{section.sheet_name} row {section.cli_row}]"
             )
             continue
