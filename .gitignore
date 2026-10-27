@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local virtual environment created by launch.py
+.venv/
+.tools_tl1/
+
+# Generated TL1 output / warnings
+*.tl1
+*.warnings.txt
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
