@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository-aware launcher for Tools TL1 Generator.
+"""Repository-aware launcher for TL1 Generator.
 
 This launcher is intentionally GitHub-Workflow-free. It runs directly from any
 clone, fork, or downloaded ZIP of the repository.
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-APP_TITLE = "Tools TL1 Generator"
+APP_TITLE = "TL1 Generator"
 MIN_PYTHON = (3, 10)
 VENV_DIRNAME = ".venv"
 STAMP_RELATIVE = Path(".tools_tl1") / "requirements.sha256"
@@ -167,7 +167,7 @@ def safe_update(root: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Launch Tools TL1 Generator directly from a GitHub clone/fork or downloaded ZIP."
+        description="Launch TL1 Generator directly from a GitHub clone/fork or downloaded ZIP."
     )
     parser.add_argument("--cli", action="store_true", help="Launch the terminal CLI instead of the GUI.")
     parser.add_argument("--update", action="store_true", help="Safely git pull --ff-only before launch.")
