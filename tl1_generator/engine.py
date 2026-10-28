@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.126.0"
+SCRIPT_VERSION = "2.127.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1880,6 +1880,205 @@ def extract_csdb_type_uri_records(
 
 
 
+
+def extract_peer_service_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CRTE-<peer> service/IP child rows sequentially.
+
+    Handles UDM/AUSF/NRF/SMF/PCF-style tables where parent identity fields are
+    followed by repeated SVC -> SCHEME -> SVCIP -> SVCPORT sequences.
+
+    Each emitted record is complete enough for rendering:
+      - first IP of first service includes parent + SVC + SCHEME + SVCIP + port
+      - additional IPs retain SVC and omit repeated SCHEME later at render time
+      - new service starts a new SVC/SCHEME context
+    """
+    cmd = section.command.upper()
+    if not cmd.startswith("CRTE-") or cmd == "CRTE-NE-GRP":
+        return []
+    if not _service_fields_present(section):
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    # Build param -> CLI aliases only for fields actually used by this command.
+    aliases: Dict[str, str] = {}
+    for param, cli in section.param_to_cli.items():
+        if not isinstance(param, str):
+            continue
+        cli_u = (cli or "").upper()
+        if cli_u in set(section.cli_order):
+            aliases[clean_param(param)] = cli_u
+
+    service_cli = {"SVC", "SCHEME", "SVCIP", "SVCPORT", "SVCID"}
+    object_name = cmd[5:]
+    key_candidates = {object_name, "ID"}
+
+    parent_cli = {
+        cli.upper() for cli in section.cli_order
+        if cli.upper() not in service_cli
+    }
+
+    all_records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find the parameter-name column in this actual Target Values block.
+        param_col = None
+        best_count = 0
+        for c in range(1, ws.max_column + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 150) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        parent_record: Dict[str, Any] = {}
+        current_svc = None
+        current_scheme = None
+        current_ip = None
+        current_port = None
+
+        block_records: List[Dict[str, Any]] = []
+        started = False
+        blank_run = 0
+
+        def flush_ip_record() -> None:
+            nonlocal current_ip, current_port
+            if current_svc is None or current_ip is None:
+                return
+
+            rec: Dict[str, Any] = dict(parent_record)
+
+            # Store using the original mapped parameter key when possible.
+            for p, cli in aliases.items():
+                if cli == "SVC":
+                    rec[p] = current_svc
+                    break
+            if current_scheme is not None:
+                for p, cli in aliases.items():
+                    if cli == "SCHEME":
+                        rec[p] = current_scheme
+                        break
+            for p, cli in aliases.items():
+                if cli == "SVCIP":
+                    rec[p] = current_ip
+                    break
+            if current_port is not None:
+                for p, cli in aliases.items():
+                    if cli == "SVCPORT":
+                        rec[p] = current_port
+                        break
+
+            # Mark continuation records after the first complete child row.
+            if block_records:
+                rec["__ROW_ACTION__"] = "CHG"
+            block_records.append(rec)
+            current_ip = None
+            current_port = None
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            cli = aliases.get(param)
+
+            if not cli:
+                row_text = " | ".join(
+                    as_text(ws.cell(r, c).value)
+                    for c in range(1, ws.max_column + 1)
+                    if not is_blank(ws.cell(r, c).value)
+                )
+                if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+                    if started:
+                        break
+                    continue
+                if not row_text.strip():
+                    if started:
+                        blank_run += 1
+                        if blank_run >= 2:
+                            break
+                    continue
+                blank_run = 0
+                continue
+
+            started = True
+            blank_run = 0
+
+            # Read target value to the right, before duplicated Current Values.
+            raw_value = None
+            for c in range(param_col + 1, ws.max_column + 1):
+                candidate = ws.cell(r, c).value
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+                if clean_param(candidate) in aliases:
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+                raw_value = candidate
+                break
+
+            if raw_value is None:
+                continue
+
+            if clean_cell_value(raw_value) is None:
+                continue
+
+            if cli in parent_cli:
+                parent_record[param] = raw_value
+                continue
+
+            if cli == "SVC":
+                # Starting a new service means any pending IP record belongs
+                # to the previous service and should be flushed first.
+                flush_ip_record()
+                current_svc = raw_value
+                current_scheme = None
+                continue
+
+            if cli == "SCHEME":
+                current_scheme = raw_value
+                continue
+
+            if cli == "SVCIP":
+                # A new IP starts another child entry. Flush a previous pending
+                # IP if it already had a port.
+                if current_ip is not None:
+                    flush_ip_record()
+                current_ip = raw_value
+                continue
+
+            if cli == "SVCPORT":
+                current_port = raw_value
+                flush_ip_record()
+                continue
+
+        flush_ip_record()
+
+        if block_records:
+            all_records.extend(block_records)
+
+    return all_records
+
+
 def extract_ni_pf_records(
     wb_values,
     section: Section,
@@ -2253,6 +2452,11 @@ def extract_gtpc_cause_records(
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper().startswith("CRTE-") and _service_fields_present(section):
+        peer_records = extract_peer_service_records(wb_values, section, sections)
+        if peer_records:
+            return peer_records
 
     if section.command.upper() == "CRTE-NI-PF":
         ni_pf_records = extract_ni_pf_records(wb_values, section, sections)
@@ -2671,68 +2875,81 @@ def _service_fields_present(section: Section) -> bool:
 
 
 def records_to_peer_service_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
-    """Render CRTE-<NE> peer service-entry tables with arrow continuation rows.
-
-    Generic for UDM/AUSF/NRF/SMF/PCF and similar network-element peer
-    sections where the first row creates the peer and arrow rows add service
-    entries using CHG-<NE>-INF:...,MODE=ADD,... .
-    """
+    """Render peer service/IP records as one CRTE followed by CHG additions."""
     cmd = section.command.upper()
     if not cmd.startswith("CRTE-") or cmd == "CRTE-NE-GRP" or not _service_fields_present(section):
-        return []
-    if not any(_has_arrow_marker(rec) for rec in records):
         return []
 
     service_fields = {"SVC", "SCHEME", "SVCIP", "SVCPORT", "SVCID"}
     object_name = cmd[5:]
     chg_command = f"CHG-{object_name}-INF"
 
-    # Key fields to carry into CHG lines.
-    # For peer service continuation rows, only the object key is carried.
-    # Do NOT carry NAME or INSTID on CHG-<NE>-INF rows.
-    # Example required output:
-    # CHG-UDM-INF:UDM=1,MODE=ADD,SVC=nudm-ee,SVCIP=...,SVCPORT=...;
     object_key_candidates = {object_name, "ID"}
-    parent_key_order = [x for x in section.cli_order if x.upper() in object_key_candidates]
+    parent_key_order = [
+        x.upper() for x in section.cli_order
+        if x.upper() in object_key_candidates
+    ]
     if not parent_key_order and section.cli_order:
-        parent_key_order = [section.cli_order[0]]
-    chg_order = [x.upper() for x in parent_key_order] + ["MODE", "SVC", "SCHEME", "SVCIP", "SVCPORT", "SVCID"]
+        parent_key_order = [section.cli_order[0].upper()]
+
+    chg_order = parent_key_order + [
+        "MODE", "SVC", "SCHEME", "SVCIP", "SVCPORT", "SVCID"
+    ]
 
     lines: List[str] = []
     current_parent: Dict[str, str] = {}
     previous_svc: Optional[str] = None
+    created_object_key: Optional[Tuple[str, ...]] = None
 
     for rec in records:
         values = record_to_cli_values(section, rec, keep_arrows=False)
         if not values:
             continue
 
-        has_arrow = _has_arrow_marker(rec)
-        parent_values = {k: v for k, v in values.items() if k.upper() not in service_fields}
-        svc_values = {k: v for k, v in values.items() if k.upper() in service_fields}
+        parent_values = {
+            k: v for k, v in values.items()
+            if k.upper() not in service_fields
+        }
+        svc_values = {
+            k: v for k, v in values.items()
+            if k.upper() in service_fields
+        }
 
-        if not has_arrow or not current_parent:
-            current_parent.update(parent_values)
-            line = render_cli_line(cmd, section.cli_order, {**current_parent, **svc_values})
+        # Parent fields are repeated by the dedicated extractor so each record
+        # remains self-contained.
+        current_parent.update(parent_values)
+
+        key_tuple = tuple(
+            current_parent.get(k, "")
+            for k in parent_key_order
+        )
+
+        # First child for a peer object is included directly on CRTE.
+        if created_object_key != key_tuple:
+            line = render_cli_line(
+                cmd,
+                section.cli_order,
+                {**current_parent, **svc_values},
+            )
             if line:
                 lines.append(line)
-            previous_svc = svc_values.get("SVC") or previous_svc
+                created_object_key = key_tuple
+            previous_svc = svc_values.get("SVC")
             continue
 
-        # Continuation service entry. Carry only the object key(s).
-        # NAME and INSTID are intentionally omitted from CHG-<NE>-INF rows.
+        # Later child rows are additions.
         line_values: Dict[str, str] = {}
-        for key in parent_key_order:
-            k = key.upper()
+        for k in parent_key_order:
             if k in current_parent:
                 line_values[k] = current_parent[k]
         line_values["MODE"] = "ADD"
         line_values.update(svc_values)
 
-        # Avoid repeating SCHEME on the second IP row for the same service.
         current_svc = svc_values.get("SVC")
-        if current_svc and previous_svc == current_svc and "SCHEME" in line_values:
+        # Same service, second+ IP: omit repeated SCHEME.
+        if current_svc and previous_svc == current_svc:
             line_values.pop("SCHEME", None)
+
         previous_svc = current_svc or previous_svc
 
         line = render_cli_line(
@@ -2745,7 +2962,6 @@ def records_to_peer_service_tl1(section: Section, records: List[Dict[str, Any]])
             lines.append(line)
 
     return lines
-
 
 
 def records_to_mmertal_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
