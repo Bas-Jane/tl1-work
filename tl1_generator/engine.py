@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.115.0"
+SCRIPT_VERSION = "2.118.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -430,6 +430,16 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     if cmd == "CHG-DSCP-INF" and cli == "SVC":
         return quote_if_needed(value.upper())
 
+    # CHG-NFM-CONF SUBSNFTYPE accepts an ampersand-separated list.
+    # Example: {AMF, UDM} -> AMF&UDM
+    if cmd == "CHG-NFM-CONF" and cli == "SUBSNFTYPE":
+        raw = value.strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1].strip()
+        parts = [p.strip() for p in re.split(r"[,;|&]+", raw) if p.strip()]
+        normalized = "&".join(p.upper() for p in parts)
+        return quote_if_needed(normalized)
+
     # Keep prior important case-sensitive fields stable when this simplified
     # script is used directly.
     preserve_case = {"NFID", "FQDN", "SVCID", "INSTID", "PGWFQDN", "DFTDNN", "APN"}
@@ -438,8 +448,10 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
         return quote_if_needed(value)
     if cli in lower_case:
         return quote_if_needed(value.lower())
+    # CRTE-SVC-VER requires NF values in uppercase.
+    # Example: NF=smf -> NF=SMF
     if cmd == "CRTE-SVC-VER" and cli == "NF":
-        return quote_if_needed(value.lower())
+        return quote_if_needed(value.upper())
 
     text = value.upper()
     if cli == "TYPE" and text == "MEMORY":
@@ -2369,6 +2381,104 @@ def records_to_conditioned_tl1(
     return lines
 
 
+
+def records_to_gtpc_cause_tl1(
+    section: Section,
+    records: List[Dict[str, Any]],
+) -> List[str]:
+    """Render hierarchical GTPC-CAUSE child-list rows."""
+    if section.command.upper() != "CRTE-GTPC-CAUSE":
+        return []
+
+    aliases = {
+        "gtpc-cause-index": "INDEX",
+        "gtpc-cause-name": "NAME",
+        "gtpc-interface-entry/gtpc-cause-interface": "INTF",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-protocol": "PROTC",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-error-code": "GTPCC",
+    }
+
+    lines: List[str] = []
+    current_index = None
+    current_name = None
+    current_intf = None
+    pending_protc = None
+    created = False
+
+    for rec in records:
+        normalized: Dict[str, Any] = {}
+        for param, value in rec.items():
+            if str(param).startswith("__"):
+                continue
+            cli = aliases.get(param) or section.param_to_cli.get(param)
+            if cli:
+                normalized[cli] = value
+
+        if "INDEX" in normalized:
+            current_index = normalized["INDEX"]
+        if "NAME" in normalized:
+            current_name = normalized["NAME"]
+
+        # Emit CRTE once enough table identity is known.
+        if not created and current_index is not None and current_name is not None:
+            vals: Dict[str, str] = {}
+            ci = clean_cell_value(current_index)
+            cn = clean_cell_value(current_name)
+            if ci is not None:
+                vals["INDEX"] = format_tl1_value("INDEX", ci, "CRTE-GTPC-CAUSE")
+            if cn is not None:
+                vals["NAME"] = format_tl1_value("NAME", cn, "CRTE-GTPC-CAUSE")
+            line = render_cli_line("CRTE-GTPC-CAUSE", ["INDEX", "NAME"], vals)
+            if line:
+                lines.append(line)
+                created = True
+
+        if "INTF" in normalized:
+            current_intf = normalized["INTF"]
+            pending_protc = None
+            continue
+
+        if "PROTC" in normalized:
+            pending_protc = normalized["PROTC"]
+            continue
+
+        if "GTPCC" in normalized:
+            vals: Dict[str, str] = {}
+            if current_index is not None:
+                v = clean_cell_value(current_index)
+                if v is not None:
+                    vals["INDEX"] = format_tl1_value("INDEX", v, "CHG-GTPC-CAUSE")
+            if current_name is not None:
+                v = clean_cell_value(current_name)
+                if v is not None:
+                    vals["NAME"] = format_tl1_value("NAME", v, "CHG-GTPC-CAUSE")
+
+            vals["MODE"] = "ADD"
+
+            if current_intf is not None:
+                v = clean_cell_value(current_intf)
+                if v is not None:
+                    vals["INTF"] = format_tl1_value("INTF", v, "CHG-GTPC-CAUSE")
+            if pending_protc is not None:
+                v = clean_cell_value(pending_protc)
+                if v is not None:
+                    vals["PROTC"] = format_tl1_value("PROTC", v, "CHG-GTPC-CAUSE")
+
+            v = clean_cell_value(normalized["GTPCC"])
+            if v is not None:
+                vals["GTPCC"] = format_tl1_value("GTPCC", v, "CHG-GTPC-CAUSE")
+
+            line = render_cli_line(
+                "CHG-GTPC-CAUSE",
+                ["INDEX", "NAME", "MODE", "INTF", "PROTC", "GTPCC"],
+                vals,
+            )
+            if line:
+                lines.append(line)
+
+    return lines
+
+
 def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     """Convert one target record into one TL1 command line.
 
@@ -2462,6 +2572,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-GTPC-CAUSE":
+            lines = records_to_gtpc_cause_tl1(section, records)
         elif section.param_fixed_cli_values:
             lines = records_to_conditioned_tl1(section, records)
         elif section.command.upper() == "CRTE-NE-GRP":
