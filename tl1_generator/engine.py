@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.130.0"
+SCRIPT_VERSION = "2.131.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -473,7 +473,7 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
 
 def iter_used_cells(ws) -> Iterable[Tuple[int, int, Any]]:
-    for row in ws.iter_rows():
+    for row in ws.iter_rows(min_col=1, max_col=scan_column_limit(ws)):
         for cell in row:
             if cell.value is not None:
                 yield cell.row, cell.column, cell.value
@@ -485,7 +485,7 @@ def get_effective_value(ws_values, row: int, col: int) -> Any:
 
 def row_values(ws, row: int, start_col: int = 1, end_col: Optional[int] = None) -> List[Any]:
     if end_col is None:
-        end_col = ws.max_column
+        end_col = scan_column_limit(ws)
     return [ws.cell(row=row, column=c).value for c in range(start_col, end_col + 1)]
 
 
@@ -557,7 +557,7 @@ def find_section_title(ws_values, cli_row: int) -> str:
     """Find nearest non-empty title above CLI command. Preferred title is a cell with '(...)'."""
     best = ""
     for r in range(cli_row - 1, max(0, cli_row - 12), -1):
-        for c in range(1, ws_values.max_column + 1):
+        for c in range(1, scan_column_limit(ws_values) + 1):
             text = as_text(ws_values.cell(r, c).value)
             if not text:
                 continue
@@ -587,7 +587,7 @@ def is_out_of_scope_section(ws_values, section: Section, next_cli_row: int) -> b
     for r in range(start_row, end_row + 1):
         row_values_text = [
             as_text(ws_values.cell(r, c).value)
-            for c in range(1, ws_values.max_column + 1)
+            for c in range(1, scan_column_limit(ws_values) + 1)
         ]
         row_norm = [re.sub(r"\s+", " ", v).strip().lower() for v in row_values_text if v]
 
@@ -635,7 +635,7 @@ def find_key_cli_names(
     header_row = None
 
     for r in range(cli_row, max_row + 1):
-        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1)]
         if any(t in {"parameters", "paramaters"} for t in texts):
             header_row = r
             break
@@ -645,7 +645,7 @@ def find_key_cli_names(
 
     type_col = None
     cli_col = None
-    for c in range(1, ws_values.max_column + 1):
+    for c in range(1, scan_column_limit(ws_values) + 1):
         key = norm_key(ws_values.cell(header_row, c).value)
         if key == "type":
             type_col = c
@@ -659,7 +659,7 @@ def find_key_cli_names(
     for r in range(header_row + 1, max_row + 1):
         row_text = " | ".join(
             as_text(ws_values.cell(r, c).value)
-            for c in range(1, ws_values.max_column + 1)
+            for c in range(1, scan_column_limit(ws_values) + 1)
         )
         if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
             break
@@ -728,7 +728,7 @@ def find_parameter_fixed_cli_values(
     max_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
     header_row = None
     for r in range(cli_row, max_row + 1):
-        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1)]
         if any(t in {"parameters", "paramaters"} for t in texts):
             header_row = r
             break
@@ -737,7 +737,7 @@ def find_parameter_fixed_cli_values(
 
     param_col = None
     cli_col = None
-    for c in range(1, ws_values.max_column + 1):
+    for c in range(1, scan_column_limit(ws_values) + 1):
         key = norm_key(ws_values.cell(header_row, c).value)
         if key in {"parameters", "paramaters"}:
             param_col = c
@@ -750,7 +750,7 @@ def find_parameter_fixed_cli_values(
     for r in range(header_row + 1, max_row + 1):
         row_text = " | ".join(
             as_text(ws_values.cell(r, c).value)
-            for c in range(1, ws_values.max_column + 1)
+            for c in range(1, scan_column_limit(ws_values) + 1)
         )
         if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
             break
@@ -770,7 +770,7 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
     header_row = None
 
     for r in range(cli_row, max_row + 1):
-        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1)]
         if any(t in {"parameters", "paramaters"} for t in texts):
             header_row = r
             break
@@ -781,7 +781,7 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
     # Locate PARAMATERS and CLI Name columns.
     param_col = None
     cli_name_col = None
-    for c in range(1, ws_values.max_column + 1):
+    for c in range(1, scan_column_limit(ws_values) + 1):
         text = norm_key(ws_values.cell(header_row, c).value)
         if text in {"parameters", "paramaters"}:
             param_col = c
@@ -794,7 +794,7 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
     mapping: Dict[str, str] = {}
     for r in range(header_row + 1, max_row + 1):
         # Stop at first Target Values block, next section title, or next CLI command.
-        row_text = " | ".join(as_text(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1))
+        row_text = " | ".join(as_text(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1))
         if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
             break
 
@@ -823,6 +823,61 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
     return mapping
 
 
+
+# -----------------------------
+# Performance helpers
+# -----------------------------
+DEFAULT_SCAN_MAX_COLUMNS = 256
+
+def scan_column_limit(ws_values) -> int:
+    """Return a practical upper column bound for CIQ scanning.
+
+    Excel files often report a very large max_column because of formatting,
+    merged cells, or stale styles far to the right of the real CIQ data.
+    Scanning all of those columns repeatedly is extremely expensive.
+
+    Override with:
+        TL1_SCAN_MAX_COLUMNS=0   -> scan all worksheet columns
+        TL1_SCAN_MAX_COLUMNS=N   -> scan at most N columns
+
+    The default 256 columns comfortably includes the normal CIQ area,
+    including requirement/value columns such as AA and beyond.
+    """
+    raw = os.environ.get("TL1_SCAN_MAX_COLUMNS", str(DEFAULT_SCAN_MAX_COLUMNS)).strip()
+    try:
+        configured = int(raw)
+    except ValueError:
+        configured = DEFAULT_SCAN_MAX_COLUMNS
+
+    if configured <= 0:
+        return ws_values.max_column
+    return min(ws_values.max_column, max(32, configured))
+
+
+# Cache case-insensitive parameter lookup tables by the identity of the
+# known_params set. The cache retains the set object, so Python cannot recycle
+# its id for a different set while the cached entry exists.
+_PARAM_MATCH_CACHE: Dict[int, Tuple[set[str], Dict[str, str]]] = {}
+
+def _known_param_lower_map(known_params: set[str]) -> Dict[str, str]:
+    key = id(known_params)
+    cached = _PARAM_MATCH_CACHE.get(key)
+    if cached is not None and cached[0] is known_params:
+        return cached[1]
+
+    lower_map = {str(k).lower(): k for k in known_params}
+    _PARAM_MATCH_CACHE[key] = (known_params, lower_map)
+
+    # Keep memory bounded for workbooks containing many sections.
+    if len(_PARAM_MATCH_CACHE) > 512:
+        # Dropping the oldest-ish entries is sufficient; exact LRU behavior is
+        # unnecessary here.
+        for old_key in list(_PARAM_MATCH_CACHE.keys())[:256]:
+            _PARAM_MATCH_CACHE.pop(old_key, None)
+
+    return lower_map
+
+
 def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]:
     sections: List[Section] = []
     for sheet_name in sheets_to_scan:
@@ -843,7 +898,12 @@ def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]
             print(f"Scanning first {max_scan_row:,} rows for CLI sections on large sheet '{sheet_name}' "
                   f"({ws.max_row:,} total rows). Set TL1_CLI_SCAN_MAX_ROWS=0 to scan all rows.")
 
-        for row in ws.iter_rows(min_row=1, max_row=max_scan_row):
+        for row in ws.iter_rows(
+            min_row=1,
+            max_row=max_scan_row,
+            min_col=1,
+            max_col=scan_column_limit(ws),
+        ):
             for cell in row:
                 if cell.value is None:
                     continue
@@ -911,7 +971,7 @@ def find_parameter_table_end(ws_values, section: Section, next_cli_row: int) -> 
     max_row = min(ws_values.max_row, next_cli_row - 1)
     header_row = None
     for r in range(section.cli_row + 1, max_row + 1):
-        row_texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        row_texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1)]
         if any(t in {"parameters", "paramaters"} for t in row_texts):
             header_row = r
             break
@@ -920,10 +980,10 @@ def find_parameter_table_end(ws_values, section: Section, next_cli_row: int) -> 
 
     last = header_row
     for r in range(header_row + 1, max_row + 1):
-        row_join = " | ".join(as_text(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1))
+        row_join = " | ".join(as_text(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1))
         if TARGET_RE.search(row_join):
             break
-        for c in range(1, ws_values.max_column + 1):
+        for c in range(1, scan_column_limit(ws_values) + 1):
             if clean_param(ws_values.cell(r, c).value) in known_params:
                 last = r
                 break
@@ -960,7 +1020,12 @@ def find_target_markers(ws_values, start_row: int = 1, end_row: Optional[int] = 
 
     markers = []
     max_r = min(end_row, ws_values.max_row)
-    for row in ws_values.iter_rows(min_row=start_row, max_row=max_r):
+    for row in ws_values.iter_rows(
+        min_row=start_row,
+        max_row=max_r,
+        min_col=1,
+        max_col=scan_column_limit(ws_values),
+    ):
         for cell in row:
             if cell.value is None:
                 continue
@@ -973,7 +1038,7 @@ def find_referred_sheet_name(ws_values, start_row: int, end_row: Optional[int] =
     if end_row is None:
         end_row = ws_values.max_row
     for r in range(start_row, min(end_row, ws_values.max_row) + 1):
-        for c in range(1, ws_values.max_column + 1):
+        for c in range(1, scan_column_limit(ws_values) + 1):
             text = as_text(ws_values.cell(r, c).value)
             m = REFER_RE.search(text)
             if m:
@@ -1007,12 +1072,16 @@ def _param_match(value: Any, known_params: set[str]) -> Optional[str]:
     if cli_text in known_params:
         return cli_text
 
-    # Accept case-insensitive parameter/header match.
-    known_lower = {k.lower(): k for k in known_params}
-    if text.lower() in known_lower:
-        return known_lower[text.lower()]
-    if cli_text.lower() in known_lower:
-        return known_lower[cli_text.lower()]
+    # Accept case-insensitive parameter/header match. The lookup map is cached
+    # per known_params set; older versions rebuilt this dictionary for every
+    # cell examined, which became a major CPU hot spot on large sheets.
+    known_lower = _known_param_lower_map(known_params)
+    text_lower = text.lower()
+    cli_lower = cli_text.lower()
+    if text_lower in known_lower:
+        return known_lower[text_lower]
+    if cli_lower in known_lower:
+        return known_lower[cli_lower]
 
     return None
 
@@ -1026,8 +1095,8 @@ def _region_end_row(ws_values, marker_row: int, next_section_row: Optional[int] 
 
 def target_column_bounds(ws_values, marker_row: int, marker_col: int) -> Tuple[int, int]:
     """Return inclusive target value column bounds, stopping before Current Values."""
-    end_col = ws_values.max_column
-    for c in range(marker_col + 1, ws_values.max_column + 1):
+    end_col = scan_column_limit(ws_values)
+    for c in range(marker_col + 1, scan_column_limit(ws_values) + 1):
         if CURRENT_RE.search(as_text(ws_values.cell(marker_row, c).value)):
             end_col = c - 1
             break
@@ -1134,7 +1203,7 @@ def row_starts_documentation_block(ws_values, row: int, scan_cols: Optional[Sequ
     These are not configuration records and must terminate target parsing.
     """
     if scan_cols is None:
-        scan_cols = range(1, ws_values.max_column + 1)
+        scan_cols = range(1, scan_column_limit(ws_values) + 1)
 
     vals = [
         re.sub(r"\s+", " ", as_text(ws_values.cell(row, c).value)).strip().lower()
@@ -1181,7 +1250,7 @@ def row_starts_next_section_header(
     current target table.
     """
     if scan_cols is None:
-        scan_cols = range(1, ws_values.max_column + 1)
+        scan_cols = range(1, scan_column_limit(ws_values) + 1)
 
     vals = [
         re.sub(r"\s+", " ", as_text(ws_values.cell(row, c).value)).strip().lower()
@@ -1402,12 +1471,12 @@ def parse_embedded_parameter_target_values(
     target_col = None
 
     for r in range(section.cli_row, max_row + 1):
-        row_texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        row_texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, scan_column_limit(ws_values) + 1)]
         if not any(t in {"parameters", "paramaters"} for t in row_texts):
             continue
 
         header_row = r
-        for c in range(1, ws_values.max_column + 1):
+        for c in range(1, scan_column_limit(ws_values) + 1):
             raw = as_text(ws_values.cell(r, c).value)
             key = norm_key(raw)
             if key in {"parameters", "paramaters"}:
@@ -1515,7 +1584,7 @@ def extract_act_lic_record(
     signature = None
 
     for r in range(section.cli_row, min(next_cli_row - 1, ws.max_row) + 1):
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             label = as_text(ws.cell(r, c).value)
             if not label:
                 continue
@@ -1531,7 +1600,7 @@ def extract_act_lic_record(
 
             # Value is normally in the next non-empty cell on the same row.
             value = None
-            for vc in range(c + 1, ws.max_column + 1):
+            for vc in range(c + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, vc).value
                 if candidate is None or as_text(candidate) == "":
                     continue
@@ -1625,11 +1694,11 @@ def extract_meas_kday_records(
     target_col = None
 
     for r in range(section.cli_row, min(next_cli_row - 1, ws.max_row) + 1):
-        row_texts = [norm_key(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        row_texts = [norm_key(ws.cell(r, c).value) for c in range(1, scan_column_limit(ws) + 1)]
         if not any(t in {"parameters", "paramaters"} for t in row_texts):
             continue
         header_row = r
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             raw = as_text(ws.cell(r, c).value)
             key = norm_key(raw)
             if key in {"parameters", "paramaters"}:
@@ -1731,7 +1800,7 @@ def extract_csdb_local_remote_records(
 
         # Identify columns by their known YANG headers.
         header_by_col: Dict[int, str] = {}
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             header = clean_param(ws.cell(header_row, c).value).strip().lower()
             if header:
                 header_by_col[c] = header
@@ -1842,7 +1911,7 @@ def extract_csdb_type_uri_records(
     for marker_row, _marker_col in marker_rows:
         header_row = marker_row + 1
         headers = {}
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             h = clean_param(ws.cell(header_row, c).value).lower()
             if h:
                 headers[h] = c
@@ -1949,7 +2018,7 @@ def extract_snssai_records(
         # Find parameter-name column in this actual target block.
         param_col = None
         best_count = 0
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             count = 0
             for r in range(marker_row + 1, min(end_row, marker_row + 120) + 1):
                 if clean_param(ws.cell(r, c).value) in aliases:
@@ -1975,7 +2044,7 @@ def extract_snssai_records(
             if not cli:
                 row_text = " | ".join(
                     as_text(ws.cell(r, c).value)
-                    for c in range(1, ws.max_column + 1)
+                    for c in range(1, scan_column_limit(ws) + 1)
                     if not is_blank(ws.cell(r, c).value)
                 )
                 if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
@@ -1998,7 +2067,7 @@ def extract_snssai_records(
             # parameter/value columns begin.
             raw_value = None
             duplicate_param_col = None
-            for c in range(param_col + 1, ws.max_column + 1):
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, c).value
                 candidate_param = clean_param(candidate)
                 if candidate_param in aliases:
@@ -2016,7 +2085,7 @@ def extract_snssai_records(
             if clean_cell_value(raw_value) is None:
                 continue
 
-            status_end = (duplicate_param_col - 1) if duplicate_param_col else ws.max_column
+            status_end = (duplicate_param_col - 1) if duplicate_param_col else scan_column_limit(ws)
             excluded = _row_has_excluded_marker(
                 ws, r, param_col + 1, max(param_col + 1, status_end)
             )
@@ -2113,7 +2182,7 @@ def extract_amf_peer_records(
         # Locate the parameter-name column in this actual Target Values block.
         param_col = None
         best_count = 0
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             count = 0
             for r in range(marker_row + 1, min(end_row, marker_row + 120) + 1):
                 p = clean_param(ws.cell(r, c).value)
@@ -2175,7 +2244,7 @@ def extract_amf_peer_records(
             if not cli:
                 row_text = " | ".join(
                     as_text(ws.cell(r, c).value)
-                    for c in range(1, ws.max_column + 1)
+                    for c in range(1, scan_column_limit(ws) + 1)
                     if not is_blank(ws.cell(r, c).value)
                 )
                 if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
@@ -2196,7 +2265,7 @@ def extract_amf_peer_records(
 
             # Read target value to the right, stopping before Current Values.
             raw_value = None
-            for c in range(param_col + 1, ws.max_column + 1):
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, c).value
                 if is_blank(candidate) or is_status(candidate):
                     continue
@@ -2312,7 +2381,7 @@ def extract_peer_service_records(
         # Find the parameter-name column in this actual Target Values block.
         param_col = None
         best_count = 0
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             count = 0
             for r in range(marker_row + 1, min(end_row, marker_row + 150) + 1):
                 p = clean_param(ws.cell(r, c).value)
@@ -2376,7 +2445,7 @@ def extract_peer_service_records(
             if not cli:
                 row_text = " | ".join(
                     as_text(ws.cell(r, c).value)
-                    for c in range(1, ws.max_column + 1)
+                    for c in range(1, scan_column_limit(ws) + 1)
                     if not is_blank(ws.cell(r, c).value)
                 )
                 if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
@@ -2397,7 +2466,7 @@ def extract_peer_service_records(
 
             # Read target value to the right, before duplicated Current Values.
             raw_value = None
-            for c in range(param_col + 1, ws.max_column + 1):
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, c).value
                 if is_blank(candidate) or is_status(candidate):
                     continue
@@ -2495,7 +2564,7 @@ def extract_ni_pf_records(
 
         for r in range(marker_row + 1, min(end_row, marker_row + 6) + 1):
             matches: Dict[str, int] = {}
-            for c in range(1, ws.max_column + 1):
+            for c in range(1, scan_column_limit(ws) + 1):
                 p = clean_param(ws.cell(r, c).value)
                 if p in aliases:
                     matches[p] = c
@@ -2612,7 +2681,7 @@ def extract_ne_grp_records(
         # Locate the parameter-name column in this actual Target Values block.
         param_col = None
         best_count = 0
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             count = 0
             for r in range(marker_row + 1, min(end_row, marker_row + 100) + 1):
                 p = clean_param(ws.cell(r, c).value)
@@ -2642,7 +2711,7 @@ def extract_ne_grp_records(
                 # blank separators or a new Target Values / section marker.
                 row_values = [
                     ws.cell(r, c).value
-                    for c in range(1, ws.max_column + 1)
+                    for c in range(1, scan_column_limit(ws) + 1)
                 ]
                 row_text = " | ".join(as_text(v) for v in row_values if not is_blank(v))
 
@@ -2669,7 +2738,7 @@ def extract_ne_grp_records(
 
             # Read target value to the right, before duplicated Current Values.
             raw_value = None
-            for c in range(param_col + 1, ws.max_column + 1):
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, c).value
                 if is_blank(candidate) or is_status(candidate):
                     continue
@@ -2758,7 +2827,7 @@ def extract_gtpc_cause_records(
         # Locate the vertical parameter-name column in the actual Target Values block.
         param_col = None
         best_count = 0
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, scan_column_limit(ws) + 1):
             count = 0
             for r in range(marker_row + 1, min(end_row, marker_row + 100) + 1):
                 p = clean_param(ws.cell(r, c).value)
@@ -2788,7 +2857,7 @@ def extract_gtpc_cause_records(
             # Target value is the first meaningful cell to the right of param,
             # before duplicated Current Values columns begin.
             value = None
-            for c in range(param_col + 1, ws.max_column + 1):
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
                 candidate = ws.cell(r, c).value
                 if is_blank(candidate) or is_status(candidate):
                     continue
