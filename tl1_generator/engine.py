@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.131.0"
+SCRIPT_VERSION = "2.134.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1967,6 +1967,137 @@ def _row_has_excluded_marker(
     return False
 
 
+
+def extract_epc_snssai_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract EPC-SNSSAI parent rows and repeated child DNN/SNSSAI mappings."""
+    if section.command.upper() != "CRTE-EPC-SNSSAI":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    all_records: List[Dict[str, Any]] = []
+
+    target_params = {
+        "epc-snssai-id",
+        "epc-snssai-name",
+        "epc-snssai-snssai-id",
+        "epc-snssai-dnn-entry/epc-snssai-dnn",
+        "epc-snssai-dnn-entry/epc-snssai-dnn-snssai-id",
+    }
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        header_row = None
+        header_items: List[Tuple[str, int]] = []
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 15) + 1):
+            found: List[Tuple[str, int]] = []
+            for c in range(1, scan_column_limit(ws) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in target_params:
+                    found.append((p, c))
+
+            if len(found) >= 3:
+                id_cols = [c for p, c in found if p == "epc-snssai-id"]
+                current_start_col = id_cols[1] if len(id_cols) > 1 else scan_column_limit(ws) + 1
+                header_items = [(p, c) for p, c in found if c < current_start_col]
+                if len(header_items) >= 3:
+                    header_row = r
+                    break
+
+        if header_row is None:
+            continue
+
+        # Preserve first target-side occurrence of each parameter.
+        target_cols: Dict[str, int] = {}
+        for p, c in header_items:
+            target_cols.setdefault(p, c)
+
+        current_parent: Dict[str, Any] = {}
+
+        def is_arrow(v: Any) -> bool:
+            t = as_text(v).strip()
+            return t in {"↪", "⇢"} or normalize_row_action(v) is not None
+
+        for r in range(header_row + 1, end_row + 1):
+            row_values = {
+                p: ws.cell(r, c).value
+                for p, c in target_cols.items()
+            }
+
+            id_raw = row_values.get("epc-snssai-id")
+            name_raw = row_values.get("epc-snssai-name")
+            parent_snssai_raw = row_values.get("epc-snssai-snssai-id")
+            dnn_raw = row_values.get("epc-snssai-dnn-entry/epc-snssai-dnn")
+            child_snssai_raw = row_values.get("epc-snssai-dnn-entry/epc-snssai-dnn-snssai-id")
+
+            if all(is_blank(v) for v in row_values.values()):
+                continue
+
+            continuation = is_arrow(id_raw) or is_arrow(name_raw) or is_arrow(parent_snssai_raw)
+
+            if not continuation:
+                current_parent = {}
+
+                if clean_cell_value(id_raw) is not None:
+                    current_parent["epc-snssai-id"] = id_raw
+                if clean_cell_value(name_raw) is not None:
+                    current_parent["epc-snssai-name"] = name_raw
+                if clean_cell_value(parent_snssai_raw) is not None:
+                    current_parent["epc-snssai-snssai-id"] = parent_snssai_raw
+
+                if "epc-snssai-id" not in current_parent:
+                    continue
+
+                rec = dict(current_parent)
+
+                # Child-list values must be added separately after the create.
+                if clean_cell_value(dnn_raw) is not None:
+                    rec["__EPC_CHILD_DNN__"] = dnn_raw
+                if clean_cell_value(child_snssai_raw) is not None:
+                    rec["__EPC_CHILD_SNSSAI__"] = child_snssai_raw
+
+                all_records.append(rec)
+                continue
+
+            if not current_parent:
+                continue
+
+            child_dnn = clean_cell_value(dnn_raw)
+            child_snssai = clean_cell_value(child_snssai_raw)
+            if child_dnn is None and child_snssai is None:
+                continue
+
+            rec = dict(current_parent)
+            if child_dnn is not None:
+                rec["__EPC_CHILD_DNN__"] = dnn_raw
+            if child_snssai is not None:
+                rec["__EPC_CHILD_SNSSAI__"] = child_snssai_raw
+            rec["__ROW_ACTION__"] = "CHG"
+            all_records.append(rec)
+
+    section.param_to_cli.setdefault("epc-snssai-id", "ID")
+    section.param_to_cli.setdefault("epc-snssai-name", "NAME")
+    section.param_to_cli.setdefault("epc-snssai-snssai-id", "SNSSAI")
+
+    return all_records
+
+
 def extract_snssai_records(
     wb_values,
     section: Section,
@@ -1978,8 +2109,8 @@ def extract_snssai_records(
       - one base profile context (ID/SST/SD/EBIALLOC/NASCGST/PRI)
       - one record per valid DNN/PDUCONF/INH child mapping
 
-    DNN rows explicitly marked with an X/cross are skipped together with their
-    following PDUCONF/INH rows.
+    Comparison/status markers such as X/cross do not suppress Target Values;
+    DNN/PDUCONF/INH rows are generated whenever the target value itself is valid.
     """
     if section.command.upper() != "CRTE-SNSSAI":
         return []
@@ -2033,7 +2164,6 @@ def extract_snssai_records(
         base_record: Dict[str, Any] = {}
         child_records: List[Dict[str, Any]] = []
         current_child: Optional[Dict[str, Any]] = None
-        current_child_excluded = False
         started = False
         blank_run = 0
 
@@ -2085,31 +2215,27 @@ def extract_snssai_records(
             if clean_cell_value(raw_value) is None:
                 continue
 
-            status_end = (duplicate_param_col - 1) if duplicate_param_col else scan_column_limit(ws)
-            excluded = _row_has_excluded_marker(
-                ws, r, param_col + 1, max(param_col + 1, status_end)
-            )
-
+            # Comparison/status markers such as ✓ or 🗙 describe the current
+            # state comparison. They do NOT suppress a Target Value. In
+            # particular, a DNN row with 🗙 still needs to be generated so the
+            # target configuration can be applied.
             if cli in base_cli:
                 base_record[param] = raw_value
                 continue
 
             if cli == "DNN":
-                if current_child and not current_child_excluded:
+                if current_child:
                     child_records.append(current_child)
 
-                current_child = {}
-                current_child_excluded = excluded
-                if not excluded:
-                    current_child[param] = raw_value
+                current_child = {param: raw_value}
                 continue
 
             if cli in {"PDUCONF", "INH"}:
-                if current_child is None or current_child_excluded:
+                if current_child is None:
                     continue
                 current_child[param] = raw_value
 
-        if current_child and not current_child_excluded:
+        if current_child:
             child_records.append(current_child)
 
         # Emit one combined record per valid DNN mapping.
@@ -2894,6 +3020,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
 
+    if section.command.upper() == "CRTE-EPC-SNSSAI":
+        epc_records = extract_epc_snssai_records(wb_values, section, sections)
+        if epc_records:
+            return epc_records
+
     if section.command.upper() == "CRTE-SNSSAI":
         snssai_records = extract_snssai_records(wb_values, section, sections)
         if snssai_records:
@@ -3149,6 +3280,102 @@ def render_cli_line(
     return f"{command}:{','.join(parts)};"
 
 
+
+
+
+def records_to_epc_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render EPC-SNSSAI parent creates and child additions separately."""
+    if section.command.upper() != "CRTE-EPC-SNSSAI":
+        return []
+
+    lines: List[str] = []
+    created_ids: set[str] = set()
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "ID" not in vals:
+            continue
+
+        epc_id = vals["ID"]
+
+        child_dnn = None
+        child_snssai = None
+
+        child_dnn_raw = rec.get("__EPC_CHILD_DNN__")
+        if child_dnn_raw is not None and clean_cell_value(child_dnn_raw) is not None:
+            child_dnn = format_tl1_value(
+                "DNN",
+                as_text(child_dnn_raw),
+                "CHG-EPC-SNSSAI",
+            )
+
+        child_snssai_raw = rec.get("__EPC_CHILD_SNSSAI__")
+        if child_snssai_raw is not None and clean_cell_value(child_snssai_raw) is not None:
+            child_snssai = format_tl1_value(
+                "SNSSAI",
+                as_text(child_snssai_raw),
+                "CHG-EPC-SNSSAI",
+            )
+
+        if epc_id not in created_ids:
+            create_vals = {
+                k: vals[k]
+                for k in ("ID", "NAME", "SNSSAI")
+                if k in vals
+            }
+
+            line = render_cli_line(
+                "CRTE-EPC-SNSSAI",
+                ["ID", "NAME", "SNSSAI"],
+                create_vals,
+                required_order=["ID", "NAME", "SNSSAI"],
+            )
+            if line:
+                lines.append(line)
+                created_ids.add(epc_id)
+
+            if child_dnn is not None or child_snssai is not None:
+                chg_vals = {"ID": epc_id, "MODE": "ADD"}
+                if child_dnn is not None:
+                    chg_vals["DNN"] = child_dnn
+                if child_snssai is not None:
+                    chg_vals["SNSSAI"] = child_snssai
+
+                # CHG-EPC-SNSSAI ordering requirement:
+                # MODE=ADD must be emitted before DNN, and any child
+                # parameters that follow DNN must remain after it.
+                chg_order = ["ID", "NAME", "MODE", "DNN", "SNSSAI"]
+                line = render_cli_line(
+                    "CHG-EPC-SNSSAI",
+                    chg_order,
+                    chg_vals,
+                    required_order=chg_order,
+                )
+                if line:
+                    lines.append(line)
+            continue
+
+        if child_dnn is None and child_snssai is None:
+            continue
+
+        chg_vals = {"ID": epc_id, "MODE": "ADD"}
+        if child_dnn is not None:
+            chg_vals["DNN"] = child_dnn
+        if child_snssai is not None:
+            chg_vals["SNSSAI"] = child_snssai
+
+        # Keep MODE=ADD immediately before DNN for continuation rows too.
+        chg_order = ["ID", "NAME", "MODE", "DNN", "SNSSAI"]
+        line = render_cli_line(
+            "CHG-EPC-SNSSAI",
+            chg_order,
+            chg_vals,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
 
 
 def records_to_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -3822,6 +4049,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-EPC-SNSSAI":
+            lines = records_to_epc_snssai_tl1(section, records)
         elif section.command.upper() == "CRTE-SNSSAI":
             lines = records_to_snssai_tl1(section, records)
         elif section.command.upper() == "CRTE-NI-PF":
