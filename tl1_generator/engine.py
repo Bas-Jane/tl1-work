@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.111.0"
+SCRIPT_VERSION = "2.112.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -63,6 +63,7 @@ class Section:
     cli_order: List[str]
     param_to_cli: Dict[str, str]
     key_cli_names: Optional[set[str]] = None
+    param_fixed_cli_values: Optional[Dict[str, Dict[str, str]]] = None
 
 
 # -----------------------------
@@ -83,6 +84,40 @@ def clean_cli_name(value: Any) -> str:
     s = s.replace("[", "").replace("]", "")
     s = s.strip().strip(",;:")
     return s.upper()
+
+
+
+def parse_cli_name_spec(value: Any) -> Tuple[str, Dict[str, str]]:
+    """Parse a CLI Name cell and optional fixed assignments.
+
+    Examples:
+        [DSCP] ([DIR] = UL) -> ("DSCP", {"DIR": "UL"})
+        [MBR]  ([DIR] = DL) -> ("MBR", {"DIR": "DL"})
+        [VAL]                -> ("VAL", {})
+    """
+    raw = as_text(value)
+    if not raw:
+        return "", {}
+
+    # Primary CLI parameter: prefer the first bracketed token.
+    m = re.search(r"\[\s*([A-Za-z][A-Za-z0-9_]*)\s*\]", raw)
+    if m:
+        cli_name = clean_cli_name(m.group(1))
+    else:
+        # Fallback to text before an annotation parenthesis/newline.
+        primary = re.split(r"[\r\n(]", raw, maxsplit=1)[0]
+        cli_name = clean_cli_name(primary)
+
+    fixed: Dict[str, str] = {}
+    for key, val in re.findall(
+        r"\[\s*([A-Za-z][A-Za-z0-9_]*)\s*\]\s*=\s*([A-Za-z0-9_.\-]+)",
+        raw,
+        flags=re.I,
+    ):
+        fixed[clean_cli_name(key)] = as_text(val).strip().upper()
+
+    return cli_name, fixed
+
 
 
 def clean_param(value: Any) -> str:
@@ -637,6 +672,57 @@ def record_has_only_default_non_key_values(section: Section, record: Dict[str, A
     )
 
 
+
+def find_parameter_fixed_cli_values(
+    ws_values,
+    cli_row: int,
+    next_cli_row: int,
+) -> Dict[str, Dict[str, str]]:
+    """Return fixed CLI assignments attached to parameter rows.
+
+    This captures CIQ annotations such as:
+        [DSCP] ([DIR] = UL)
+        [DSCP] ([DIR] = DL)
+    """
+    max_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
+    header_row = None
+    for r in range(cli_row, max_row + 1):
+        texts = [norm_key(ws_values.cell(r, c).value) for c in range(1, ws_values.max_column + 1)]
+        if any(t in {"parameters", "paramaters"} for t in texts):
+            header_row = r
+            break
+    if header_row is None:
+        return {}
+
+    param_col = None
+    cli_col = None
+    for c in range(1, ws_values.max_column + 1):
+        key = norm_key(ws_values.cell(header_row, c).value)
+        if key in {"parameters", "paramaters"}:
+            param_col = c
+        elif key == "cli name":
+            cli_col = c
+    if param_col is None or cli_col is None:
+        return {}
+
+    result: Dict[str, Dict[str, str]] = {}
+    for r in range(header_row + 1, max_row + 1):
+        row_text = " | ".join(
+            as_text(ws_values.cell(r, c).value)
+            for c in range(1, ws_values.max_column + 1)
+        )
+        if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+            break
+
+        param = clean_param(ws_values.cell(r, param_col).value)
+        if is_placeholder_param(param):
+            continue
+        _cli, fixed = parse_cli_name_spec(ws_values.cell(r, cli_col).value)
+        if fixed:
+            result[param] = fixed
+    return result
+
+
 def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: int) -> Dict[str, str]:
     """Find Parameters table after CLI row and return parameter leaf -> CLI name."""
     max_row = min(ws_values.max_row, next_cli_row - 1 if next_cli_row else ws_values.max_row)
@@ -672,7 +758,7 @@ def find_parameter_mapping(ws_values, cli_row: int, cli_col: int, next_cli_row: 
             break
 
         param = clean_param(ws_values.cell(r, param_col).value)
-        cli_name = clean_cli_name(ws_values.cell(r, cli_name_col).value)
+        cli_name, _fixed_values = parse_cli_name_spec(ws_values.cell(r, cli_name_col).value)
 
         # Placeholder Parameter values such as "-" are not real parameter
         # names. Do not use them as mapping keys or later rows will overwrite
@@ -731,6 +817,7 @@ def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]
             title = find_section_title(ws, r)
             mapping = find_parameter_mapping(ws, r, c, next_cli_row)
             key_cli_names = find_key_cli_names(ws, r, next_cli_row)
+            param_fixed_cli_values = find_parameter_fixed_cli_values(ws, r, next_cli_row)
             # Keep the explicit CLI Name column as the source of truth.
             # Earlier versions inferred CLI names from the YANG leaf suffix for every row,
             # but that broke valid child-list mappings such as:
@@ -761,6 +848,7 @@ def discover_sections(wb_values, sheets_to_scan: Sequence[str]) -> List[Section]
                     cli_order=cli_order,
                     param_to_cli=mapping,
                     key_cli_names=key_cli_names,
+                    param_fixed_cli_values=param_fixed_cli_values,
                 )
             )
     return sections
@@ -1544,9 +1632,86 @@ def extract_meas_kday_records(
     return [grouped[name] for name in order]
 
 
+
+def extract_csdb_type_uri_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Parse the newer CRTE-CSDB:TYPE,URI target layout.
+
+    Source table columns:
+        csdb-info-single-redun-type
+        csdb-info-ip
+        csdb-info-port
+        csdb-info-name
+
+    The CLI only exposes TYPE and URI, so URI is composed as <IP>:<PORT>.
+    Braces around leaf-list IP values are removed.
+    """
+    if section.command.upper() != "CRTE-CSDB":
+        return []
+    if [x.upper() for x in section.cli_order] != ["TYPE", "URI"]:
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    marker_rows = find_target_markers(ws, section.cli_row, next_cli_row - 1)
+    if not marker_rows:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for marker_row, _marker_col in marker_rows:
+        header_row = marker_row + 1
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            h = clean_param(ws.cell(header_row, c).value).lower()
+            if h:
+                headers[h] = c
+
+        type_col = headers.get("csdb-info-single-redun-type")
+        ip_col = headers.get("csdb-info-ip")
+        port_col = headers.get("csdb-info-port")
+        if not (type_col and ip_col and port_col):
+            continue
+
+        for r in range(header_row + 1, min(next_cli_row - 1, ws.max_row) + 1):
+            t = as_text(ws.cell(r, type_col).value)
+            ip = as_text(ws.cell(r, ip_col).value)
+            port = as_text(ws.cell(r, port_col).value)
+            if not t and not ip and not port:
+                break
+            if not (t and ip and port):
+                continue
+
+            # Leaf-list single value may be written as {10.1.2.3}.
+            ip = ip.strip()
+            if ip.startswith("{") and ip.endswith("}"):
+                ip = ip[1:-1].strip()
+
+            records.append({"TYPE": t, "URI": f"{ip}:{port}"})
+
+        if records:
+            break
+
+    section.param_to_cli.setdefault("TYPE", "TYPE")
+    section.param_to_cli.setdefault("URI", "URI")
+    return records
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CRTE-CSDB" and [x.upper() for x in section.cli_order] == ["TYPE", "URI"]:
+        csdb_records = extract_csdb_type_uri_records(wb_values, section, sections)
+        if csdb_records:
+            return csdb_records
 
     if section.command.upper() == "CHG-MEAS-KDAY":
         meas_records = extract_meas_kday_records(wb_values, section, sections)
@@ -1568,11 +1733,14 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
     markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
     records: List[Dict[str, Any]] = []
     for marker_row, marker_col in markers:
-        records.extend(parse_horizontal_targets(ws, marker_row, marker_col, known_params, next_cli_row))
-        if not records:
-            records.extend(parse_vertical_targets(ws, marker_row, marker_col, known_params, next_cli_row))
-        if records:
-            break
+        block_records = parse_horizontal_targets(
+            ws, marker_row, marker_col, known_params, next_cli_row
+        )
+        if not block_records:
+            block_records = parse_vertical_targets(
+                ws, marker_row, marker_col, known_params, next_cli_row
+            )
+        records.extend(block_records)
 
     # 2) If target block is only a pointer, follow "Refer to <sheet> sheet".
     if not records:
@@ -1582,11 +1750,14 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
             ref_ws = wb_values[referred_sheet_name]
             ref_markers = find_target_markers(ref_ws)
             for marker_row, marker_col in ref_markers:
-                records.extend(parse_horizontal_targets(ref_ws, marker_row, marker_col, known_params))
-                if not records:
-                    records.extend(parse_vertical_targets(ref_ws, marker_row, marker_col, known_params))
-                if records:
-                    break
+                block_records = parse_horizontal_targets(
+                    ref_ws, marker_row, marker_col, known_params
+                )
+                if not block_records:
+                    block_records = parse_vertical_targets(
+                        ref_ws, marker_row, marker_col, known_params
+                    )
+                records.extend(block_records)
 
     # 3) Fallback: some sections keep Target Value directly inside the
     # PARAMATERS table and have no separate Target Values block.
@@ -1966,6 +2137,73 @@ def records_to_mmertal_tl1(section: Section, records: List[Dict[str, Any]]) -> L
     return lines
 
 
+
+def records_to_conditioned_tl1(
+    section: Section,
+    records: List[Dict[str, Any]],
+) -> List[str]:
+    """Render rows with parameter-specific fixed CLI assignments.
+
+    Generic example:
+        QCI is unconditional
+        DSCP parameter A has DIR=UL
+        DSCP parameter B has DIR=DL
+
+    One target row becomes two TL1 lines, one per fixed-condition group.
+    """
+    conditions = section.param_fixed_cli_values or {}
+    if not conditions:
+        return []
+
+    lines: List[str] = []
+    for record in records:
+        if record_has_only_default_non_key_values(section, record):
+            continue
+
+        base_values: Dict[str, str] = {}
+        grouped: Dict[Tuple[Tuple[str, str], ...], Dict[str, str]] = {}
+
+        for param, raw_value in record.items():
+            if str(param).startswith("__"):
+                continue
+
+            cli_name = section.param_to_cli.get(param)
+            if not cli_name:
+                continue
+
+            if is_arrow_value(raw_value):
+                continue
+            cleaned = clean_cell_value(raw_value)
+            if cleaned is None:
+                continue
+
+            formatted = format_tl1_value(cli_name, cleaned, section.command)
+            fixed = conditions.get(param, {})
+            if fixed:
+                sig = tuple(sorted((k.upper(), v) for k, v in fixed.items()))
+                bucket = grouped.setdefault(sig, {})
+                bucket[cli_name.upper()] = formatted
+            else:
+                base_values[cli_name.upper()] = formatted
+
+        # Fixed CLI values from the command template are unconditional.
+        base_values.update(extract_fixed_cli_values(section.raw_cli))
+
+        if not grouped:
+            continue
+
+        for sig, conditional_values in grouped.items():
+            values = dict(base_values)
+            for k, v in sig:
+                values[k] = format_tl1_value(k, v, section.command)
+            values.update(conditional_values)
+            line = render_cli_line(section.command, section.cli_order, values)
+            if line:
+                lines.append(line)
+
+    return lines
+
+
 def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     """Convert one target record into one TL1 command line.
 
@@ -2059,6 +2297,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.param_fixed_cli_values:
+            lines = records_to_conditioned_tl1(section, records)
         elif section.command.upper() == "CRTE-NE-GRP":
             lines = records_to_ne_grp_tl1(section, records)
         elif section.command.upper() == "CRTE-MMERTAL":
