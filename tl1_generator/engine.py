@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.128.0"
+SCRIPT_VERSION = "2.130.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1882,6 +1882,179 @@ def extract_csdb_type_uri_records(
 
 
 
+
+def _row_has_excluded_marker(
+    ws_values,
+    row: int,
+    start_col: int,
+    end_col: int,
+) -> bool:
+    """Detect an explicit excluded/not-selected marker on a target row."""
+    bad = {"🗙", "✗", "✕", "×", "x"}
+    for c in range(start_col, end_col + 1):
+        value = as_text(ws_values.cell(row, c).value).strip().lower()
+        if value in bad:
+            return True
+    return False
+
+
+def extract_snssai_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract SNSSAI parent fields and repeated DNN child mappings.
+
+    Every Target Values block yields:
+      - one base profile context (ID/SST/SD/EBIALLOC/NASCGST/PRI)
+      - one record per valid DNN/PDUCONF/INH child mapping
+
+    DNN rows explicitly marked with an X/cross are skipped together with their
+    following PDUCONF/INH rows.
+    """
+    if section.command.upper() != "CRTE-SNSSAI":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    aliases = {
+        "snssai-id": "ID",
+        "snssai-sst": "SST",
+        "snssai-sd": "SD",
+        "snssai-ebialloc": "EBIALLOC",
+        "snssai-nascgst": "NASCGST",
+        "snssai-priority": "PRI",
+        "snssai-dft-snssai": "DFT",
+        "snssai-dnn-info-entry/snssai-dnn": "DNN",
+        "snssai-dnn-info-entry/snssai-pduconf": "PDUCONF",
+        "snssai-dnn-info-entry/snssai-inh": "INH",
+    }
+
+    base_cli = {"ID", "SST", "SD", "EBIALLOC", "NASCGST", "PRI", "DFT"}
+    all_records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find parameter-name column in this actual target block.
+        param_col = None
+        best_count = 0
+        for c in range(1, ws.max_column + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 120) + 1):
+                if clean_param(ws.cell(r, c).value) in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        base_record: Dict[str, Any] = {}
+        child_records: List[Dict[str, Any]] = []
+        current_child: Optional[Dict[str, Any]] = None
+        current_child_excluded = False
+        started = False
+        blank_run = 0
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            cli = aliases.get(param)
+
+            if not cli:
+                row_text = " | ".join(
+                    as_text(ws.cell(r, c).value)
+                    for c in range(1, ws.max_column + 1)
+                    if not is_blank(ws.cell(r, c).value)
+                )
+                if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+                    if started:
+                        break
+                    continue
+                if not row_text.strip():
+                    if started:
+                        blank_run += 1
+                        if blank_run >= 2:
+                            break
+                    continue
+                blank_run = 0
+                continue
+
+            started = True
+            blank_run = 0
+
+            # Read first target value to the right, before duplicated current
+            # parameter/value columns begin.
+            raw_value = None
+            duplicate_param_col = None
+            for c in range(param_col + 1, ws.max_column + 1):
+                candidate = ws.cell(r, c).value
+                candidate_param = clean_param(candidate)
+                if candidate_param in aliases:
+                    duplicate_param_col = c
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    duplicate_param_col = c
+                    break
+                if raw_value is None and not is_blank(candidate) and not is_status(candidate):
+                    raw_value = candidate
+
+            if raw_value is None:
+                continue
+
+            if clean_cell_value(raw_value) is None:
+                continue
+
+            status_end = (duplicate_param_col - 1) if duplicate_param_col else ws.max_column
+            excluded = _row_has_excluded_marker(
+                ws, r, param_col + 1, max(param_col + 1, status_end)
+            )
+
+            if cli in base_cli:
+                base_record[param] = raw_value
+                continue
+
+            if cli == "DNN":
+                if current_child and not current_child_excluded:
+                    child_records.append(current_child)
+
+                current_child = {}
+                current_child_excluded = excluded
+                if not excluded:
+                    current_child[param] = raw_value
+                continue
+
+            if cli in {"PDUCONF", "INH"}:
+                if current_child is None or current_child_excluded:
+                    continue
+                current_child[param] = raw_value
+
+        if current_child and not current_child_excluded:
+            child_records.append(current_child)
+
+        # Emit one combined record per valid DNN mapping.
+        for child in child_records:
+            rec = dict(base_record)
+            rec.update(child)
+            all_records.append(rec)
+
+    for param, cli in aliases.items():
+        section.param_to_cli.setdefault(param, cli)
+
+    return all_records
+
+
 def extract_amf_peer_records(
     wb_values,
     section: Section,
@@ -2652,6 +2825,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
 
+    if section.command.upper() == "CRTE-SNSSAI":
+        snssai_records = extract_snssai_records(wb_values, section, sections)
+        if snssai_records:
+            return snssai_records
+
     if section.command.upper() == "CRTE-AMF":
         amf_records = extract_amf_peer_records(wb_values, section, sections)
         if amf_records:
@@ -2901,6 +3079,65 @@ def render_cli_line(
         return None
     return f"{command}:{','.join(parts)};"
 
+
+
+
+def records_to_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render SNSSAI parent profile plus repeated DNN mappings correctly."""
+    if section.command.upper() != "CRTE-SNSSAI":
+        return []
+
+    lines: List[str] = []
+    created_ids: set[str] = set()
+
+    create_order = ["ID", "SST", "SD", "EBIALLOC", "NASCGST", "PRI", "DNN", "PDUCONF", "INH"]
+    # CHG-SNSSAI-INF ordering requirement:
+    # MODE=ADD must appear immediately before DNN, and all child parameters
+    # following DNN must remain after it.
+    chg_order = ["ID", "DFT", "EBIALLOC", "NASCGST", "PRI", "MODE", "DNN", "PDUCONF", "INH"]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "ID" not in vals or "DNN" not in vals:
+            continue
+
+        snssai_id = vals["ID"]
+
+        if snssai_id not in created_ids:
+            create_vals = {
+                k: vals[k]
+                for k in create_order
+                if k in vals
+            }
+            line = render_cli_line(
+                "CRTE-SNSSAI",
+                create_order,
+                create_vals,
+                required_order=create_order,
+            )
+            if line:
+                lines.append(line)
+                created_ids.add(snssai_id)
+            continue
+
+        chg_vals: Dict[str, str] = {
+            "ID": snssai_id,
+            "MODE": "ADD",
+        }
+        for k in ("DNN", "PDUCONF", "INH"):
+            if k in vals:
+                chg_vals[k] = vals[k]
+
+        line = render_cli_line(
+            "CHG-SNSSAI-INF",
+            chg_order,
+            chg_vals,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
 
 
 def records_to_ni_pf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -3516,6 +3753,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-SNSSAI":
+            lines = records_to_snssai_tl1(section, records)
         elif section.command.upper() == "CRTE-NI-PF":
             lines = records_to_ni_pf_tl1(section, records)
         elif section.command.upper() == "CRTE-GTPC-CAUSE":
