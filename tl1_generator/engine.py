@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.120.0"
+SCRIPT_VERSION = "2.126.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -436,6 +436,11 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     if cmd == "CRTE-RAD-INTF" and cli == "AF":
         return quote_if_needed(value.upper())
     if cmd == "CRTE-RAD-INTF" and cli == "KEY":
+        return quote_if_needed(value.lower())
+
+    # CRTE-RACCT requires KEY values in lowercase.
+    # Example: KEY=ABC-XYZ -> KEY=abc-xyz
+    if cmd == "CRTE-RACCT" and cli == "KEY":
         return quote_if_needed(value.lower())
 
     # CHG-NFM-CONF SUBSNFTYPE accepts an ampersand-separated list.
@@ -1873,6 +1878,276 @@ def extract_csdb_type_uri_records(
 
 
 
+
+
+def extract_ni_pf_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CRTE-NI-PF Target Values preserving arrow continuation rows.
+
+    A numeric ID row starts a new profile. Rows whose ID is an arrow inherit
+    the previous ID/NAME and add another INTF_TYPE/NI pair.
+    """
+    if section.command.upper() != "CRTE-NI-PF":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # Skip PARAMATERS table's embedded Target Value column.
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    aliases = {
+        "ni-profile-id": "ID",
+        "ni-profile-name": "NAME",
+        "ni-profile-ni-entry/ni-profile-intf-type": "INTF_TYPE",
+        "ni-profile-ni-entry/ni-profile-ni": "NI",
+    }
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find header row that contains all/most NI-PF parameter names.
+        header_row = None
+        col_map: Dict[str, int] = {}
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 6) + 1):
+            matches: Dict[str, int] = {}
+            for c in range(1, ws.max_column + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases:
+                    matches[p] = c
+            if len(matches) >= 3:
+                header_row = r
+                col_map = matches
+                break
+
+        if header_row is None:
+            continue
+
+        current_id = None
+        current_name = None
+        blank_run = 0
+
+        for r in range(header_row + 1, end_row + 1):
+            raw_id = ws.cell(r, col_map["ni-profile-id"]).value if "ni-profile-id" in col_map else None
+            raw_name = ws.cell(r, col_map["ni-profile-name"]).value if "ni-profile-name" in col_map else None
+            raw_intf = ws.cell(r, col_map["ni-profile-ni-entry/ni-profile-intf-type"]).value if "ni-profile-ni-entry/ni-profile-intf-type" in col_map else None
+            raw_ni = ws.cell(r, col_map["ni-profile-ni-entry/ni-profile-ni"]).value if "ni-profile-ni-entry/ni-profile-ni" in col_map else None
+
+            if all(is_blank(v) for v in (raw_id, raw_name, raw_intf, raw_ni)):
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            # Ignore duplicated Current Values area or metadata rows.
+            if any(is_metadata_or_helper_value(v) for v in (raw_id, raw_name, raw_intf, raw_ni)):
+                continue
+
+            if raw_id is not None and not is_arrow_value(raw_id) and not is_blank(raw_id):
+                current_id = raw_id
+            if raw_name is not None and not is_arrow_value(raw_name) and not is_blank(raw_name):
+                current_name = raw_name
+
+            if current_id is None:
+                continue
+
+            rec: Dict[str, Any] = {"ni-profile-id": current_id}
+
+            if current_name is not None:
+                rec["ni-profile-name"] = current_name
+
+            if raw_intf is not None and not is_arrow_value(raw_intf) and not is_blank(raw_intf):
+                rec["ni-profile-ni-entry/ni-profile-intf-type"] = raw_intf
+
+            if raw_ni is not None and not is_arrow_value(raw_ni) and not is_blank(raw_ni):
+                rec["ni-profile-ni-entry/ni-profile-ni"] = raw_ni
+
+            # Require at least one child mapping to avoid emitting header-like rows.
+            if (
+                "ni-profile-ni-entry/ni-profile-intf-type" in rec
+                and "ni-profile-ni-entry/ni-profile-ni" in rec
+            ):
+                records.append(rec)
+
+        if records:
+            break
+
+    for param, cli in aliases.items():
+        section.param_to_cli.setdefault(param, cli)
+
+    return records
+
+
+def extract_ne_grp_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract NE-GRP parent groups and repeated child members correctly.
+
+    Each Target Values block becomes one parent record plus one child record
+    per NEID. Repeated PRI/CAPA values are attached to the current NEID.
+    """
+    if section.command.upper() != "CRTE-NE-GRP":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    aliases = {
+        "ne-group-type": "NE",
+        "ne-group-id": "GID",
+        "ne-group-name": "GNAME",
+        "ne-group-bkup-grp-id": "BKUPGID",
+        "ne-group-sel-mth": "SELM",
+        "ne-group-tmr": "TMR",
+        "ne-group-maxchg": "MAXCHG",
+        "ne-group-af": "AF",
+        "ne-group-elem-entry/ne-group-ne-id": "NEID",
+        "ne-group-elem-entry/ne-group-pri": "PRI",
+        "ne-group-elem-entry/ne-group-capa": "CAPA",
+    }
+    parent_cli = {"NE", "GID", "GNAME", "BKUPGID", "SELM", "TMR", "MAXCHG", "AF"}
+    child_cli = {"NEID", "PRI", "CAPA"}
+
+    all_records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Locate the parameter-name column in this actual Target Values block.
+        param_col = None
+        best_count = 0
+        for c in range(1, ws.max_column + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 100) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        parent_record: Dict[str, Any] = {}
+        child_records: List[Dict[str, Any]] = []
+        current_child: Optional[Dict[str, Any]] = None
+        started = False
+        blank_run = 0
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+
+            if param not in aliases:
+                # Unsupported NE-GRP parameters (for example ne-group-minu,
+                # ne-group-grpadm, ne-group-use) can legitimately appear
+                # between supported parent fields and child NEID rows.
+                # Do not terminate on those rows. Terminate only on genuinely
+                # blank separators or a new Target Values / section marker.
+                row_values = [
+                    ws.cell(r, c).value
+                    for c in range(1, ws.max_column + 1)
+                ]
+                row_text = " | ".join(as_text(v) for v in row_values if not is_blank(v))
+
+                if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+                    if started:
+                        break
+                    continue
+
+                if not row_text.strip():
+                    if started:
+                        blank_run += 1
+                        if blank_run >= 2:
+                            break
+                    continue
+
+                # Nonblank unsupported row inside this target block: ignore it
+                # without advancing the blank-row termination counter.
+                blank_run = 0
+                continue
+
+            started = True
+            blank_run = 0
+            cli = aliases[param]
+
+            # Read target value to the right, before duplicated Current Values.
+            raw_value = None
+            for c in range(param_col + 1, ws.max_column + 1):
+                candidate = ws.cell(r, c).value
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+
+                candidate_param = clean_param(candidate)
+                if candidate_param in aliases:
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+
+                raw_value = candidate
+                break
+
+            if raw_value is None:
+                continue
+
+            # [ENC], SKIP, etc. must not be emitted.
+            cleaned_value = clean_cell_value(raw_value)
+            if cleaned_value is None:
+                continue
+
+            if cli in parent_cli:
+                parent_record[param] = raw_value
+                continue
+
+            if cli == "NEID":
+                if current_child:
+                    child_records.append(current_child)
+                current_child = {param: raw_value}
+                continue
+
+            if cli in child_cli:
+                if current_child is None:
+                    current_child = {}
+                current_child[param] = raw_value
+
+        if current_child:
+            child_records.append(current_child)
+
+        if parent_record:
+            all_records.append(parent_record)
+            all_records.extend(child_records)
+
+    for param, cli in aliases.items():
+        section.param_to_cli.setdefault(param, cli)
+
+    return all_records
+
+
 def extract_gtpc_cause_records(
     wb_values,
     section: Section,
@@ -1978,6 +2253,16 @@ def extract_gtpc_cause_records(
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CRTE-NI-PF":
+        ni_pf_records = extract_ni_pf_records(wb_values, section, sections)
+        if ni_pf_records:
+            return ni_pf_records
+
+    if section.command.upper() == "CRTE-NE-GRP":
+        ne_grp_records = extract_ne_grp_records(wb_values, section, sections)
+        if ne_grp_records:
+            return ne_grp_records
 
     if section.command.upper() == "CRTE-GTPC-CAUSE":
         gtpc_records = extract_gtpc_cause_records(wb_values, section, sections)
@@ -2209,46 +2494,169 @@ def render_cli_line(
     return f"{command}:{','.join(parts)};"
 
 
-def records_to_ne_grp_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
-    """Special renderer for NE-GRP tables with arrow continuation rows.
 
-    First full row creates CRTE-NE-GRP. Rows with arrow markers inherit the
-    parent group fields and create CHG-NE-GRP rows using the current NEID/CAPA/etc.
-    This matches CIQ group samples where continuation rows add group members.
+def records_to_ni_pf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render NI-PF so each ID is created once, then continuation mappings are added.
+
+    Example:
+      CRTE-NI-PF:ID=1,NAME=NI-UPF-SPGW,INTF_TYPE=N3N9,NI=NI-UPF-N3N9;
+      CHG-NI-PF:ID=1,MODE=ADD,INTF_TYPE=S1U,NI=NI-SGW-S1U;
+      CHG-NI-PF:ID=1,MODE=ADD,INTF_TYPE=S5S8U,NI=NI-PGW-S5S8U;
+    """
+    if section.command.upper() != "CRTE-NI-PF":
+        return []
+
+    lines: List[str] = []
+    current_id: Optional[str] = None
+    current_name: Optional[str] = None
+    created_ids: set[str] = set()
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals:
+            continue
+
+        if "ID" in vals:
+            current_id = vals["ID"]
+        if "NAME" in vals:
+            current_name = vals["NAME"]
+
+        if current_id is None:
+            continue
+
+        intf = vals.get("INTF_TYPE")
+        ni = vals.get("NI")
+        if not intf or not ni:
+            continue
+
+        # First mapping for an ID creates the profile.
+        if current_id not in created_ids:
+            create_vals = {
+                "ID": current_id,
+                "INTF_TYPE": intf,
+                "NI": ni,
+            }
+            if current_name:
+                create_vals["NAME"] = current_name
+
+            line = render_cli_line(
+                "CRTE-NI-PF",
+                ["ID", "NAME", "INTF_TYPE", "NI"],
+                create_vals,
+                required_order=["ID", "NAME", "INTF_TYPE", "NI"],
+            )
+            if line:
+                lines.append(line)
+                created_ids.add(current_id)
+            continue
+
+        # Additional mappings for the same ID are appended with MODE=ADD.
+        chg_vals = {
+            "ID": current_id,
+            "MODE": "ADD",
+            "INTF_TYPE": intf,
+            "NI": ni,
+        }
+        line = render_cli_line(
+            "CHG-NI-PF",
+            ["ID", "MODE", "INTF_TYPE", "NI"],
+            chg_vals,
+            required_order=["ID", "MODE", "INTF_TYPE", "NI"],
+        )
+        if line:
+            lines.append(line)
+
+    return lines
+
+
+def records_to_ne_grp_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render NE-GRP with the first child member on CRTE and later members on CHG.
+
+    Example:
+      CRTE-NE-GRP:NE=PCRF,GID=1,GNAME=...,SELM=PRI,TMR=1,MAXCHG=1,NEID=1,PRI=1;
+      CHG-NE-GRP:NE=PCRF,GID=1,MODE=ADD,NEID=2,PRI=2;
     """
     if section.command.upper() != "CRTE-NE-GRP":
         return []
 
-    parent_fields = ["NE", "GID", "GNAME", "BKUPGID", "DFTGID", "DFLTGID", "DEFAULTGID", "DEFGID", "SELM", "IFDIR"]
+    parent_fields = [
+        "NE", "GID", "GNAME", "BKUPGID",
+        "DFTGID", "DFLTGID", "DEFAULTGID", "DEFGID",
+        "SELM", "TMR", "MAXCHG", "AF", "IFDIR"
+    ]
     child_fields = ["NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"]
+
     crte_order = [x for x in section.cli_order if x in parent_fields + child_fields]
     if not crte_order:
-        crte_order = ["NE", "GID", "GNAME", "BKUPGID", "SELM", "IFDIR", "NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"]
+        crte_order = [
+            "NE", "GID", "GNAME", "BKUPGID", "SELM", "TMR", "MAXCHG", "AF",
+            "NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"
+        ]
+
     chg_order = ["NE", "GID", "MODE", "NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"]
 
     lines: List[str] = []
     current_parent: Dict[str, str] = {}
+    pending_parent: Optional[Dict[str, str]] = None
+    first_child_emitted = False
 
     for rec in records:
         values = record_to_cli_values(section, rec, keep_arrows=False)
         if not values:
             continue
 
-        # A new group starts whenever NE or GID is explicitly provided in the row.
-        starts_new_group = any(k in values for k in ("NE", "GID", "GNAME"))
-        if starts_new_group or not current_parent:
-            current_parent.update({k: v for k, v in values.items() if k in parent_fields})
-            line_values = {**current_parent, **{k: v for k, v in values.items() if k in child_fields}}
+        parent_values = {k: v for k, v in values.items() if k in parent_fields}
+        child_values = {k: v for k, v in values.items() if k in child_fields}
+
+        # A row with parent fields starts a new group context. Do not emit CRTE
+        # yet; wait for the first child so it can be included on the create line.
+        if parent_values:
+            current_parent = dict(parent_values)
+            pending_parent = dict(parent_values)
+            first_child_emitted = False
+
+            # If the same record already contains child fields, emit immediately.
+            if child_values:
+                line_values = {**current_parent, **child_values}
+                line = render_cli_line("CRTE-NE-GRP", crte_order, line_values)
+                if line:
+                    lines.append(line)
+                    first_child_emitted = True
+                    pending_parent = None
+            continue
+
+        if not child_values:
+            continue
+
+        # First child for this group belongs on CRTE.
+        if not first_child_emitted:
+            line_values = {**current_parent, **child_values}
             line = render_cli_line("CRTE-NE-GRP", crte_order, line_values)
             if line:
                 lines.append(line)
-        else:
-            line_values = {k: v for k, v in current_parent.items() if k in {"NE", "GID"}}
-            line_values["MODE"] = "ADD"
-            line_values.update({k: v for k, v in values.items() if k in child_fields})
-            line = render_cli_line("CHG-NE-GRP", chg_order, line_values, required_order=chg_order)
-            if line:
-                lines.append(line)
+                first_child_emitted = True
+                pending_parent = None
+            continue
+
+        # Remaining children are added with MODE=ADD.
+        line_values = {k: v for k, v in current_parent.items() if k in {"NE", "GID"}}
+        line_values["MODE"] = "ADD"
+        line_values.update(child_values)
+
+        line = render_cli_line(
+            "CHG-NE-GRP",
+            chg_order,
+            line_values,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    # Defensive fallback: if a group has no child rows at all, still emit CRTE.
+    if pending_parent and not first_child_emitted:
+        line = render_cli_line("CRTE-NE-GRP", crte_order, pending_parent)
+        if line:
+            lines.append(line)
 
     return lines
 
@@ -2688,6 +3096,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-NI-PF":
+            lines = records_to_ni_pf_tl1(section, records)
         elif section.command.upper() == "CRTE-GTPC-CAUSE":
             lines = records_to_gtpc_cause_tl1(section, records)
         elif section.param_fixed_cli_values:
