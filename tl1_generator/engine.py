@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.112.0"
+SCRIPT_VERSION = "2.113.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1633,6 +1633,133 @@ def extract_meas_kday_records(
 
 
 
+
+def _strip_single_value_braces(value: Any) -> str:
+    """Remove outer { } from a single-value list representation."""
+    text = as_text(value).strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text[1:-1].strip()
+    return text
+
+
+def extract_csdb_local_remote_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Parse CRTE-CSDB:LOCALIP,LOCALPORT,[REMOTEIP],[REMOTEPORT],NAME.
+
+    Supports CIQ layouts where:
+      - a `local` row stores IP/port under csdb-info-ip / csdb-info-port
+      - a `remote` row stores IP/port in the following two target columns
+        (often labeled 0 / 0 or left blank in the template)
+      - NAME is populated on each row
+
+    Each source row becomes one TL1 record:
+      local  -> LOCALIP, LOCALPORT, NAME
+      remote -> REMOTEIP, REMOTEPORT, NAME
+    """
+    if section.command.upper() != "CRTE-CSDB":
+        return []
+
+    order = [x.upper() for x in section.cli_order]
+    expected = ["LOCALIP", "LOCALPORT", "REMOTEIP", "REMOTEPORT", "NAME"]
+    if order != expected:
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    markers = find_target_markers(ws, section.cli_row, next_cli_row - 1)
+    if not markers:
+        return []
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, _marker_col in markers:
+        header_row = marker_row + 1
+
+        # Identify columns by their known YANG headers.
+        header_by_col: Dict[int, str] = {}
+        for c in range(1, ws.max_column + 1):
+            header = clean_param(ws.cell(header_row, c).value).strip().lower()
+            if header:
+                header_by_col[c] = header
+
+        type_col = next((c for c, h in header_by_col.items()
+                         if h == "csdb-info-single-redun-type"), None)
+        ip_col = next((c for c, h in header_by_col.items()
+                       if h == "csdb-info-ip"), None)
+        port_col = next((c for c, h in header_by_col.items()
+                         if h == "csdb-info-port"), None)
+        name_col = next((c for c, h in header_by_col.items()
+                         if h == "csdb-info-name"), None)
+
+        if not all([type_col, ip_col, port_col, name_col]):
+            continue
+
+        # The remote IP/port columns immediately follow the local port column
+        # in this layout, before NAME.
+        remote_ip_col = port_col + 1
+        remote_port_col = port_col + 2
+
+        for r in range(header_row + 1, min(next_cli_row - 1, ws.max_row) + 1):
+            redun_type = as_text(ws.cell(r, type_col).value).strip().lower()
+            if not redun_type:
+                # Stop after data has begun and a blank row is reached.
+                if records:
+                    break
+                continue
+
+            name = as_text(ws.cell(r, name_col).value).strip()
+            rec: Dict[str, Any] = {}
+
+            if redun_type == "local":
+                ip = _strip_single_value_braces(ws.cell(r, ip_col).value)
+                port = as_text(ws.cell(r, port_col).value).strip()
+                if ip:
+                    rec["LOCALIP"] = ip
+                if port:
+                    rec["LOCALPORT"] = port
+                if name:
+                    rec["NAME"] = name
+
+            elif redun_type == "remote":
+                ip = _strip_single_value_braces(ws.cell(r, remote_ip_col).value)
+                port = as_text(ws.cell(r, remote_port_col).value).strip()
+
+                # Defensive fallback for templates that keep remote values in
+                # the same IP/PORT columns as local.
+                if not ip:
+                    ip = _strip_single_value_braces(ws.cell(r, ip_col).value)
+                if not port:
+                    port = as_text(ws.cell(r, port_col).value).strip()
+
+                if ip:
+                    rec["REMOTEIP"] = ip
+                if port:
+                    rec["REMOTEPORT"] = port
+                if name:
+                    rec["NAME"] = name
+            else:
+                continue
+
+            if rec:
+                records.append(rec)
+
+        if records:
+            break
+
+    for cli in expected:
+        section.param_to_cli.setdefault(cli, cli)
+
+    return records
+
+
 def extract_csdb_type_uri_records(
     wb_values,
     section: Section,
@@ -1708,10 +1835,18 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
 
-    if section.command.upper() == "CRTE-CSDB" and [x.upper() for x in section.cli_order] == ["TYPE", "URI"]:
-        csdb_records = extract_csdb_type_uri_records(wb_values, section, sections)
-        if csdb_records:
-            return csdb_records
+    if section.command.upper() == "CRTE-CSDB":
+        csdb_order = [x.upper() for x in section.cli_order]
+
+        if csdb_order == ["LOCALIP", "LOCALPORT", "REMOTEIP", "REMOTEPORT", "NAME"]:
+            csdb_records = extract_csdb_local_remote_records(wb_values, section, sections)
+            if csdb_records:
+                return csdb_records
+
+        if csdb_order == ["TYPE", "URI"]:
+            csdb_records = extract_csdb_type_uri_records(wb_values, section, sections)
+            if csdb_records:
+                return csdb_records
 
     if section.command.upper() == "CHG-MEAS-KDAY":
         meas_records = extract_meas_kday_records(wb_values, section, sections)
