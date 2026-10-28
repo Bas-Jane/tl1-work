@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.118.0"
+SCRIPT_VERSION = "2.119.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -429,6 +429,14 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     # Example: SVC=gtpc -> SVC=GTPC
     if cmd == "CHG-DSCP-INF" and cli == "SVC":
         return quote_if_needed(value.upper())
+
+    # CRTE-RAD-INTF case rules:
+    #   AF must be uppercase (IP4 / IP6)
+    #   KEY must remain lowercase
+    if cmd == "CRTE-RAD-INTF" and cli == "AF":
+        return quote_if_needed(value.upper())
+    if cmd == "CRTE-RAD-INTF" and cli == "KEY":
+        return quote_if_needed(value.lower())
 
     # CHG-NFM-CONF SUBSNFTYPE accepts an ampersand-separated list.
     # Example: {AMF, UDM} -> AMF&UDM
