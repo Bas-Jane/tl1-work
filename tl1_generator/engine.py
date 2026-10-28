@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.119.0"
+SCRIPT_VERSION = "2.120.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1872,9 +1872,117 @@ def extract_csdb_type_uri_records(
     return records
 
 
+
+def extract_gtpc_cause_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract GTPC-CAUSE Target Values sequentially without collapsing repeats."""
+    if section.command.upper() != "CRTE-GTPC-CAUSE":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # IMPORTANT: skip the PARAMATERS header's "Target Value" column and start
+    # searching only after the parameter-definition table.
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    known_params = {
+        "gtpc-cause-index",
+        "gtpc-cause-name",
+        "gtpc-interface-entry/gtpc-cause-interface",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-protocol",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-error-code",
+    }
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Locate the vertical parameter-name column in the actual Target Values block.
+        param_col = None
+        best_count = 0
+        for c in range(1, ws.max_column + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 100) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in known_params:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        started = False
+        blank_run = 0
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            if param not in known_params:
+                if started:
+                    blank_run += 1
+                    if blank_run >= 2:
+                        break
+                continue
+
+            started = True
+            blank_run = 0
+
+            # Target value is the first meaningful cell to the right of param,
+            # before duplicated Current Values columns begin.
+            value = None
+            for c in range(param_col + 1, ws.max_column + 1):
+                candidate = ws.cell(r, c).value
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+
+                candidate_param = clean_param(candidate)
+                if candidate_param in known_params:
+                    # This is the duplicated Current Values parameter column.
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+
+                value = candidate
+                break
+
+            if value is not None:
+                records.append({param: value})
+
+        if records:
+            break
+
+    for param, cli in {
+        "gtpc-cause-index": "INDEX",
+        "gtpc-cause-name": "NAME",
+        "gtpc-interface-entry/gtpc-cause-interface": "INTF",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-protocol": "PROTC",
+        "gtpc-interface-entry/gtpc-protocol-entry/gtpc-cause-error-code": "GTPCC",
+    }.items():
+        section.param_to_cli.setdefault(param, cli)
+
+    return records
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CRTE-GTPC-CAUSE":
+        gtpc_records = extract_gtpc_cause_records(wb_values, section, sections)
+        if gtpc_records:
+            return gtpc_records
 
     if section.command.upper() == "CRTE-CSDB":
         csdb_order = [x.upper() for x in section.cli_order]
