@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.113.0"
+SCRIPT_VERSION = "2.115.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -93,22 +93,22 @@ def parse_cli_name_spec(value: Any) -> Tuple[str, Dict[str, str]]:
     Examples:
         [DSCP] ([DIR] = UL) -> ("DSCP", {"DIR": "UL"})
         [MBR]  ([DIR] = DL) -> ("MBR", {"DIR": "DL"})
-        [VAL]                -> ("VAL", {})
+        DSCP   (SVC=GTPC)   -> ("DSCP", {"SVC": "GTPC"})
+        [VAL]               -> ("VAL", {})
     """
     raw = as_text(value)
     if not raw:
         return "", {}
 
-    # Primary CLI parameter: prefer the first bracketed token.
     m = re.search(r"\[\s*([A-Za-z][A-Za-z0-9_]*)\s*\]", raw)
     if m:
         cli_name = clean_cli_name(m.group(1))
     else:
-        # Fallback to text before an annotation parenthesis/newline.
         primary = re.split(r"[\r\n(]", raw, maxsplit=1)[0]
         cli_name = clean_cli_name(primary)
 
     fixed: Dict[str, str] = {}
+
     for key, val in re.findall(
         r"\[\s*([A-Za-z][A-Za-z0-9_]*)\s*\]\s*=\s*([A-Za-z0-9_.\-]+)",
         raw,
@@ -116,9 +116,16 @@ def parse_cli_name_spec(value: Any) -> Tuple[str, Dict[str, str]]:
     ):
         fixed[clean_cli_name(key)] = as_text(val).strip().upper()
 
+    for key, val in re.findall(
+        r"(?<!\[)\b([A-Za-z][A-Za-z0-9_]*)\s*=\s*([A-Za-z0-9_.\-]+)",
+        raw,
+        flags=re.I,
+    ):
+        cli_key = clean_cli_name(key)
+        if cli_key and cli_key != cli_name:
+            fixed.setdefault(cli_key, as_text(val).strip().upper())
+
     return cli_name, fixed
-
-
 
 def clean_param(value: Any) -> str:
     """Normalize YANG/CIQ parameter paths for reliable matching.
@@ -413,6 +420,15 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     # Example: POD=SVC-MME-ANINTF-SCTP-0 -> POD=svc-mme-anintf-sctp-0
     if cli == "POD":
         return quote_if_needed(value.lower())
+
+    # DNN values must remain lowercase.
+    if cli == "DNN":
+        return quote_if_needed(value.lower())
+
+    # CHG-DSCP-INF requires SVC values in uppercase.
+    # Example: SVC=gtpc -> SVC=GTPC
+    if cmd == "CHG-DSCP-INF" and cli == "SVC":
+        return quote_if_needed(value.upper())
 
     # Keep prior important case-sensitive fields stable when this simplified
     # script is used directly.
@@ -1393,7 +1409,7 @@ def parse_embedded_parameter_target_values(
         if CLI_RE.search(row_join):
             break
 
-        cli_name = clean_cli_name(ws_values.cell(r, cli_col).value)
+        cli_name, fixed_values = parse_cli_name_spec(ws_values.cell(r, cli_col).value)
         param = clean_param(ws_values.cell(r, param_col).value) if param_col else ""
         if is_placeholder_param(param):
             param = ""
@@ -1432,6 +1448,11 @@ def parse_embedded_parameter_target_values(
         section.param_to_cli.setdefault(key, cli_name)
         section.param_to_cli.setdefault(cli_name, cli_name)
         section.param_to_cli.setdefault(f"[{cli_name}]", cli_name)
+
+        if fixed_values:
+            if section.param_fixed_cli_values is None:
+                section.param_fixed_cli_values = {}
+            section.param_fixed_cli_values[key] = fixed_values
 
         record[key] = raw_target
         useful_rows += 1
@@ -2308,12 +2329,21 @@ def records_to_conditioned_tl1(
 
             if is_arrow_value(raw_value):
                 continue
+
+            fixed = conditions.get(param, {})
+
+            # A conditioned parameter row represents its own configuration
+            # instance. If its target is [default = ...], skip that instance
+            # even when other conditioned rows in the same embedded table have
+            # explicit values.
+            if fixed and is_default_wrapped_value(raw_value):
+                continue
+
             cleaned = clean_cell_value(raw_value)
             if cleaned is None:
                 continue
 
             formatted = format_tl1_value(cli_name, cleaned, section.command)
-            fixed = conditions.get(param, {})
             if fixed:
                 sig = tuple(sorted((k.upper(), v) for k, v in fixed.items()))
                 bucket = grouped.setdefault(sig, {})
