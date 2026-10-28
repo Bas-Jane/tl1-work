@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.127.0"
+SCRIPT_VERSION = "2.128.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1881,6 +1881,205 @@ def extract_csdb_type_uri_records(
 
 
 
+
+def extract_amf_peer_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CRTE-AMF tables while preserving GUAMI, slice and service contexts.
+
+    AMF Target Values mix several child lists:
+      - parent: AMF, NAME, INSTID, ADMSTS, LOCALITY
+      - GUAMI: MCC, MNC, AMFREG, AMFSET, AMFPTR
+      - slice: SST, SD
+      - service: SVC, SCHEME, SVCIP, SVCPORT
+
+    The generic peer extractor cannot flatten these safely because repeated
+    child-list rows would shift values into the wrong CLI fields.
+    """
+    if section.command.upper() != "CRTE-AMF":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    aliases = {
+        "amf-id": "AMF",
+        "amf-name": "NAME",
+        "amf-inst-id": "INSTID",
+        "amf-admsts": "ADMSTS",
+        "amf-locality": "LOCALITY",
+        "amf-guami-entry/amf-mcc": "MCC",
+        "amf-guami-entry/amf-mnc": "MNC",
+        "amf-guami-entry/amf-region-id": "AMFREG",
+        "amf-guami-entry/amf-set-id": "AMFSET",
+        "amf-guami-entry/amf-pointer": "AMFPTR",
+        "amf-sliceinfo/amf-sst": "SST",
+        "amf-sliceinfo/amf-sd": "SD",
+        "amf-svc-entry/amf-svc-name": "SVC",
+        "amf-svc-entry/amf-svc-scheme": "SCHEME",
+        "amf-svc-entry/amf-svc-ipaddr-entry/amf-svc-ipaddr-ip": "SVCIP",
+        "amf-svc-entry/amf-svc-ipaddr-entry/amf-svc-ipaddr-port": "SVCPORT",
+    }
+
+    all_records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Locate the parameter-name column in this actual Target Values block.
+        param_col = None
+        best_count = 0
+        for c in range(1, ws.max_column + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 120) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        parent: Dict[str, Any] = {}
+        guami: Dict[str, Any] = {}
+        slice_info: Dict[str, Any] = {}
+        current_svc = None
+        current_scheme = None
+        current_ip = None
+        current_port = None
+        block_records: List[Dict[str, Any]] = []
+
+        started = False
+        blank_run = 0
+
+        def set_param_value(rec: Dict[str, Any], cli_name: str, value: Any) -> None:
+            for p, cli in aliases.items():
+                if cli == cli_name:
+                    rec[p] = value
+                    return
+
+        def flush_service_record() -> None:
+            nonlocal current_ip, current_port
+            if current_svc is None or current_ip is None:
+                return
+
+            rec: Dict[str, Any] = {}
+            rec.update(parent)
+            rec.update(guami)
+            rec.update(slice_info)
+
+            set_param_value(rec, "SVC", current_svc)
+            if current_scheme is not None:
+                set_param_value(rec, "SCHEME", current_scheme)
+            set_param_value(rec, "SVCIP", current_ip)
+            if current_port is not None:
+                set_param_value(rec, "SVCPORT", current_port)
+
+            if block_records:
+                rec["__ROW_ACTION__"] = "CHG"
+            block_records.append(rec)
+
+            current_ip = None
+            current_port = None
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            cli = aliases.get(param)
+
+            if not cli:
+                row_text = " | ".join(
+                    as_text(ws.cell(r, c).value)
+                    for c in range(1, ws.max_column + 1)
+                    if not is_blank(ws.cell(r, c).value)
+                )
+                if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+                    if started:
+                        break
+                    continue
+                if not row_text.strip():
+                    if started:
+                        blank_run += 1
+                        if blank_run >= 2:
+                            break
+                    continue
+                blank_run = 0
+                continue
+
+            started = True
+            blank_run = 0
+
+            # Read target value to the right, stopping before Current Values.
+            raw_value = None
+            for c in range(param_col + 1, ws.max_column + 1):
+                candidate = ws.cell(r, c).value
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+                if clean_param(candidate) in aliases:
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+                raw_value = candidate
+                break
+
+            if raw_value is None or clean_cell_value(raw_value) is None:
+                continue
+
+            if cli in {"AMF", "NAME", "INSTID", "ADMSTS", "LOCALITY"}:
+                set_param_value(parent, cli, raw_value)
+                continue
+
+            if cli in {"MCC", "MNC", "AMFREG", "AMFSET", "AMFPTR"}:
+                set_param_value(guami, cli, raw_value)
+                continue
+
+            if cli in {"SST", "SD"}:
+                set_param_value(slice_info, cli, raw_value)
+                continue
+
+            if cli == "SVC":
+                flush_service_record()
+                current_svc = raw_value
+                current_scheme = None
+                continue
+
+            if cli == "SCHEME":
+                current_scheme = raw_value
+                continue
+
+            if cli == "SVCIP":
+                if current_ip is not None:
+                    flush_service_record()
+                current_ip = raw_value
+                continue
+
+            if cli == "SVCPORT":
+                current_port = raw_value
+                flush_service_record()
+                continue
+
+        flush_service_record()
+        if block_records:
+            all_records.extend(block_records)
+
+    for param, cli in aliases.items():
+        section.param_to_cli.setdefault(param, cli)
+
+    return all_records
+
+
 def extract_peer_service_records(
     wb_values,
     section: Section,
@@ -2452,6 +2651,11 @@ def extract_gtpc_cause_records(
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CRTE-AMF":
+        amf_records = extract_amf_peer_records(wb_values, section, sections)
+        if amf_records:
+            return amf_records
 
     if section.command.upper().startswith("CRTE-") and _service_fields_present(section):
         peer_records = extract_peer_service_records(wb_values, section, sections)
