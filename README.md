@@ -1,8 +1,8 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.3.16  
-**TL1 engine:** v2.127.0  
+**Desktop app:** v1.3.17  
+**TL1 engine:** v2.128.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
@@ -223,7 +223,7 @@ This GitHub launch package bundles the same TL1 processing engine as the standal
 
 - Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
 - GitHub package engine: `tl1_generator/engine.py`
-- Bundled engine version: `2.127.0`
+- Bundled engine version: `2.128.0`
 
 When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
 
@@ -245,7 +245,7 @@ This keeps separate runs isolated and prevents output from different executions 
 
 ## Current engine behavior
 
-Bundled TL1 engine: `v2.127.0`
+Bundled TL1 engine: `v2.128.0`
 
 Recent parser improvements include:
 - section-scoped `Out of Scope` detection so a following section cannot incorrectly suppress the current section;
@@ -270,7 +270,7 @@ Every generation is written into a new execution-time folder created by the TL1 
 Both the standalone script and the GitHub GUI use the same engine-level output routing, so neither can bypass the timestamp folder.
 
 
-## Engine v2.127.0 rules
+## Engine v2.128.0 rules
 
 - `CHG-OVLD-CNTL` rows with `SVC="{all services}"` are skipped.
 - `CHG-VES-CNTL` rows with `EVENT={ALL}` are skipped.
@@ -278,7 +278,7 @@ Both the standalone script and the GitHub GUI use the same engine-level output r
 - TL1 files and warnings are written into the same timestamped execution folder.
 
 
-## Engine v2.127.0 default-only rule
+## Engine v2.128.0 default-only rule
 
 The generator skips a configuration record when every assigned **non-key**
 parameter is expressed as a CIQ default wrapper such as:
@@ -299,14 +299,14 @@ The parser also stops at the next CIQ section header so status text such as
 `Complete` cannot leak into the previous section's TL1 output.
 
 
-## Engine v2.127.0 update
+## Engine v2.128.0 update
 
 - `MEAS-KDAY` sections are intentionally skipped from TL1 generation.
 - The skip is written to the warnings report as `Skipped MEAS-KDAY section ...`.
 - TL1 output and the warnings report are generated in the same timestamped execution folder.
 
 
-## Engine v2.127.0 CSDB update
+## Engine v2.128.0 CSDB update
 
 The generator now supports the CSDB layout:
 
@@ -319,7 +319,7 @@ Rows with `csdb-info-single-redun-type=remote` map to `REMOTEIP/REMOTEPORT`.
 Single-value braces around IP addresses are removed automatically.
 
 
-## Engine v2.127.0 GTPC-CAUSE extraction fix
+## Engine v2.128.0 GTPC-CAUSE extraction fix
 
 The GTPC-CAUSE parser now uses a dedicated sequential Target Values extractor.
 This preserves repeated `PROTC` and `GTPCC` child rows and avoids collapsing
@@ -329,7 +329,7 @@ It also ignores the PARAMATERS table's embedded "Target Value" header and starts
 only from the real Target Values block.
 
 
-## Engine v2.127.0 NE-GRP update
+## Engine v2.128.0 NE-GRP update
 
 - Adds a dedicated sequential extractor for `CRTE-NE-GRP`.
 - Each Target Values block becomes one parent group record plus one child record per `NEID`.
@@ -338,7 +338,7 @@ only from the real Target Values block.
 - Generates `CHG-NE-GRP:NE=...,GID=...,MODE=ADD,NEID=...;` for each group member.
 
 
-## Engine v2.127.0 NI-PF update
+## Engine v2.128.0 NI-PF update
 
 - Adds a dedicated extractor for `CRTE-NI-PF`.
 - Ignores `Refer to column ...` guidance in the PARAMATERS table.
@@ -347,7 +347,7 @@ only from the real Target Values block.
 - Generates one `CRTE-NI-PF` command for every `INTF_TYPE/NI` mapping.
 
 
-## Engine v2.127.0 NI-PF correction
+## Engine v2.128.0 NI-PF correction
 
 For each NI-PF ID:
 - the first `INTF_TYPE/NI` mapping generates `CRTE-NI-PF`;
@@ -355,7 +355,7 @@ For each NI-PF ID:
 - `NAME` is only included on the create line.
 
 
-## Engine v2.127.0 NE-GRP PCRF fix
+## Engine v2.128.0 NE-GRP PCRF fix
 
 - NE-GRP extraction no longer stops on unsupported-but-valid rows such as
   `ne-group-minu`, `ne-group-grpadm`, and `ne-group-use`.
@@ -364,7 +364,7 @@ For each NI-PF ID:
 - PCRF and UPF NE-GRP structures were both regression-tested.
 
 
-## Engine v2.127.0 NE-GRP correction
+## Engine v2.128.0 NE-GRP correction
 
 For each NE-GRP group:
 - the first child member is included directly on the `CRTE-NE-GRP` line;
@@ -372,10 +372,18 @@ For each NE-GRP group:
 - parent fields such as `TMR` and `MAXCHG` remain on the create line.
 
 
-## Engine v2.127.0 peer-service fix
+## Engine v2.128.0 peer-service fix
 
 - Adds a dedicated sequential extractor for UDM/AUSF/NRF/SMF/PCF-style peer service tables.
 - Preserves every `SVC`, `SCHEME`, `SVCIP`, and `SVCPORT` entry instead of collapsing repeated child rows.
 - First service/IP entry is included on `CRTE-<peer>`.
 - Additional IPs/services are emitted with `CHG-<peer>-INF:...,MODE=ADD,...`.
 - Repeated `SCHEME` is omitted for the second+ IP of the same service.
+
+
+## Engine v2.128.0 AMF peer fix
+
+- Adds AMF-specific sequential extraction.
+- Keeps parent AMF fields, GUAMI fields, S-NSSAI fields, and service/IP fields in separate contexts.
+- Prevents `LOCALITY`, `MCC/MNC`, `AMFREG/AMFSET/AMFPTR`, and `SST/SD` from shifting into the wrong CLI positions.
+- Preserves the generic peer-service behavior for service/IP continuation rows.
