@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.159.0"
+SCRIPT_VERSION = "2.163.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -497,11 +497,22 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
 
+    # CRTE-SNSSAI DNNNAME is a leaf-list. Source may use braces, commas,
+    # and embedded line breaks; TL1 expects one quoted ampersand-separated list.
+    if cmd == "CRTE-SNSSAI" and cli == "DNNNAME":
+        raw = as_text(value).strip()
+        if raw.startswith("{") and raw.endswith("}"):
+            raw = raw[1:-1].strip()
+        raw = raw.replace("\r", "\n")
+        parts = [p.strip() for p in re.split(r"[,\n]+", raw) if p.strip()]
+        return f'"{"&".join(parts)}"'
+
     # CRTE-CNDB URI values are case-sensitive text and may contain multiple
-    # IP:port entries split across source lines. TL1 expects '&' between URIs.
+    # IP:port entries split across source lines. TL1 expects '&' between URIs
+    # and the complete URI list enclosed in double quotes.
     if cmd == "CRTE-CNDB" and cli == "URI":
-        normalized_uri = normalize_cndb_uri(value)
-        return normalized_uri.replace(",", "&")
+        normalized_uri = normalize_cndb_uri(value).replace(",", "&")
+        return f'"{normalized_uri}"'
 
 
     # CHG-FD-LMT value normalization.
@@ -587,7 +598,7 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     # script is used directly.
     preserve_case = {
         "NFID", "FQDN", "SVCID", "INSTID", "PGWFQDN", "DFTDNN", "APN",
-        "NAME", "DESC", "IFNAME",
+        "NAME", "DESC", "IFNAME", "NINAME",
     }
     lower_case = {"SVC", "HOST", "REALM"}
     # Generic comma-separated parameter lists use '&' in TL1 and are quoted
@@ -2320,7 +2331,150 @@ def extract_epc_snssai_records(
     return all_records
 
 
+
+def extract_snssai_records_upf_horizontal(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract UPF SNSSAI-INF horizontal records.
+
+    Source columns:
+      upf-snssai-sst
+      upf-snssai-sd
+      upf-snssai-dnn
+      upf-snssai-description
+    """
+    if section.command.upper() != "CRTE-SNSSAI":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    aliases = {
+        "upf-snssai-sst": "SST",
+        "upf-snssai-sd": "SD",
+        "upf-snssai-dnn": "DNNNAME",
+        "upf-snssai-description": "DESC",
+    }
+
+    # Only activate this parser for this UPF parameter family.
+    found_upf_param = False
+    for r in range(section.cli_row + 1, min(next_cli_row, section.cli_row + 80)):
+        for c in range(1, min(scan_column_limit(ws), 32) + 1):
+            if clean_param(ws.cell(r, c).value) in aliases:
+                found_upf_param = True
+                break
+        if found_upf_param:
+            break
+    if not found_upf_param:
+        return []
+
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+    section.param_to_cli["__snssai__"] = "SNSSAI"
+
+    records: List[Dict[str, Any]] = []
+
+    # Find real target marker rows.
+    marker_rows: List[int] = []
+    for r in range(section.cli_row + 1, next_cli_row):
+        row_has_target = False
+        for c in range(1, min(scan_column_limit(ws), 32) + 1):
+            val = as_text(ws.cell(r, c).value)
+            if TARGET_RE.search(val):
+                row_has_target = True
+                break
+        if row_has_target:
+            marker_rows.append(r)
+
+    # Deduplicate consecutive discovery.
+    marker_rows = sorted(set(marker_rows))
+
+    for mi, marker_row in enumerate(marker_rows):
+        end_row = marker_rows[mi + 1] - 1 if mi + 1 < len(marker_rows) else next_cli_row - 1
+
+        # Find header row and FIRST occurrence of each target header.
+        header_row = None
+        header_cols: Dict[str, int] = {}
+        for r in range(marker_row + 1, min(end_row, marker_row + 4) + 1):
+            found: Dict[str, int] = {}
+            for c in range(1, min(scan_column_limit(ws), 32) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases and p not in found:
+                    found[p] = c
+            if "upf-snssai-sst" in found and "upf-snssai-dnn" in found:
+                header_row = r
+                header_cols = found
+                break
+        if header_row is None:
+            continue
+
+        r = header_row + 1
+        while r <= end_row:
+            sst_col = header_cols["upf-snssai-sst"]
+            sst_raw = ws.cell(r, sst_col).value
+            if is_blank(sst_raw) or is_status(sst_raw):
+                r += 1
+                continue
+
+            rec: Dict[str, Any] = {}
+            for p, col in header_cols.items():
+                raw = ws.cell(r, col).value
+                if is_blank(raw) or is_status(raw) or is_reference_helper_value(raw):
+                    continue
+                rec[p] = raw
+
+            # Join DNN continuation lines if source wraps a long list.
+            dnn_col = header_cols.get("upf-snssai-dnn")
+            next_r = r + 1
+            while next_r <= end_row and dnn_col:
+                next_sst = ws.cell(next_r, sst_col).value
+                continuation = ws.cell(next_r, dnn_col).value
+                if not is_blank(next_sst):
+                    break
+                if is_blank(continuation) or is_status(continuation):
+                    break
+                existing = as_text(rec.get("upf-snssai-dnn", ""))
+                rec["upf-snssai-dnn"] = (existing + "\n" + as_text(continuation)).strip()
+                next_r += 1
+
+            sst = clean_cell_value(rec.get("upf-snssai-sst"))
+            sd = clean_cell_value(rec.get("upf-snssai-sd"))
+            if not sst:
+                r = max(next_r, r + 1)
+                continue
+
+            sd_text = as_text(sd).strip()
+            if not sd_text or sd_text.lower() == "none":
+                rec["__snssai__"] = as_text(sst).strip()
+            else:
+                # Match existing hex normalization behavior downstream.
+                rec["__snssai__"] = f"{as_text(sst).strip()}-{sd_text}"
+
+            records.append(rec)
+            r = max(next_r, r + 1)
+
+    return records
+
+
 def extract_snssai_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Route CRTE-SNSSAI to UPF horizontal or legacy parser."""
+    upf_records = extract_snssai_records_upf_horizontal(wb_values, section, sections)
+    if upf_records:
+        return upf_records
+    return extract_snssai_records_legacy(wb_values, section, sections)
+
+
+def extract_snssai_records_legacy(
     wb_values,
     section: Section,
     sections: List[Section],
@@ -3719,6 +3873,78 @@ def extract_onc_dict_records(
 
 
 
+
+def extract_ni_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CRTE-NI records from repeated vertical Target Values blocks.
+
+    This dedicated parser protects NI-INF mappings that may be missed when the
+    Parameters table contains removed/added release rows with blank CLI names.
+    In particular, `network-instance-gtpu-id-list` must map to GTPUID.
+    """
+    if section.command.upper() != "CRTE-NI":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    aliases = {
+        "network-instance-id": "NI",
+        "network-instance-virtual-routing-id": "VR",
+        "network-instance-name": "NAME",
+        "network-instance-default": "DFLT",
+        "network-instance-tunnel-type": "TUN",
+        "network-instance-tunnel-source-ip4": "TSRCIP",
+        "network-instance-tunnel-destination-ip": "TDSTIP",
+        "network-instance-policy-forwarding-ip4": "FWD4",
+        "network-instance-policy-forwarding-ip6": "FWD6",
+        "network-instance-gtpu-id-list": "GTPUID",
+    }
+    for param, cli in aliases.items():
+        section.param_to_cli[param] = cli
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        rec: Dict[str, Any] = {}
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, marker_col).value)
+            if not param:
+                # Most NI target layouts place parameter names one column to
+                # the right of the Target Values marker.
+                param = clean_param(ws.cell(r, marker_col + 1).value)
+                value_col = marker_col + 2
+            else:
+                value_col = marker_col + 1
+
+            if param not in aliases:
+                continue
+
+            raw = ws.cell(r, value_col).value
+            if is_blank(raw) or is_status(raw) or is_reference_helper_value(raw):
+                continue
+            if clean_cell_value(raw) is None:
+                continue
+
+            rec[param] = raw
+
+        if "network-instance-id" in rec and "network-instance-name" in rec:
+            records.append(rec)
+
+    return records
+
+
 def extract_gr_bgp_rpc_records(
     wb_values,
     section: Section,
@@ -4212,6 +4438,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CRTE-NI":
+        ni_records = extract_ni_records(wb_values, section, sections)
+        if ni_records:
+            return ni_records
 
     if section.command.upper() == "CHG-GR-BGP":
         gr_bgp_records = extract_gr_bgp_rpc_records(wb_values, section, sections)
@@ -4894,6 +5125,25 @@ def records_to_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> Li
         return []
 
     lines: List[str] = []
+    # UPF SNSSAI-INF uses a different CLI shape:
+    # CRTE-SNSSAI:[SNSSAI],SST,[SD],[DNN],[DNNNAME],[DESC];
+    if "SNSSAI" in {x.upper() for x in section.cli_order} and "DNNNAME" in {x.upper() for x in section.cli_order}:
+        upf_lines: List[str] = []
+        order = ["SNSSAI", "SST", "SD", "DNN", "DNNNAME", "DESC"]
+        for rec in records:
+            vals = record_to_cli_values(section, rec, keep_arrows=False)
+            if not vals or "SNSSAI" not in vals or "SST" not in vals:
+                continue
+            line = render_cli_line(
+                "CRTE-SNSSAI",
+                order,
+                vals,
+                required_order=order,
+            )
+            if line:
+                upf_lines.append(line)
+        return upf_lines
+
     created_ids: set[str] = set()
 
     create_order = ["ID", "SST", "SD", "EBIALLOC", "NASCGST", "PRI", "DNN", "PDUCONF", "INH"]
