@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.134.0"
+SCRIPT_VERSION = "2.137.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -367,7 +367,7 @@ def clean_cell_value(value: Any) -> Optional[str]:
     if not text:
         return ""
 
-    # Convert [default = none] -> none, [default = nspt] -> nspt first.
+    # Convert [default = none] -> none, [default = {1}] -> {1} first.
     m = re.search(r"\[\s*default\s*=\s*([^\]]+)\]", text, re.I)
     if m:
         text = m.group(1).strip()
@@ -375,9 +375,40 @@ def clean_cell_value(value: Any) -> Optional[str]:
     if is_skip_value(text):
         return None
 
+    # Normalize complete outer-brace syntax here as well as in the final value
+    # formatter. Doing it at both stages guarantees that generic renderers,
+    # special renderers, and values unwrapped from [default = ...] all behave
+    # consistently.
+    text = normalize_braced_tl1_value(text)
+
     # Remove surrounding quotes only; field-specific formatting is applied later.
     text = text.strip().strip('"').strip("'")
     return text
+
+
+
+def normalize_braced_tl1_value(value: str) -> str:
+    """Convert CIQ brace notation into TL1 value notation.
+
+    Examples:
+      {XY}          -> XY
+      {XY, ZX}      -> XY&ZX
+      {XY,ZX,AB}    -> XY&ZX&AB
+
+    The conversion is applied only when the complete trimmed value is enclosed
+    by one outer pair of braces. Empty list items are ignored.
+    """
+    raw = as_text(value).strip()
+    if len(raw) < 2 or not (raw.startswith("{") and raw.endswith("}")):
+        return raw
+
+    inner = raw[1:-1].strip()
+    if not inner:
+        return ""
+
+    parts = [part.strip() for part in inner.split(",")]
+    parts = [part for part in parts if part]
+    return "&".join(parts)
 
 
 def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
@@ -387,6 +418,7 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     lowercase because Kubernetes/OpenShift pod/service interface names are
     case-sensitive in the generated command.
     """
+    value = normalize_braced_tl1_value(value)
     if value == "":
         return ""
 
@@ -3016,9 +3048,136 @@ def extract_gtpc_cause_records(
     return records
 
 
+
+
+def extract_pdu_conf_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PDU-CONF parent plus repeated DSCP child tuples."""
+    if section.command.upper() != "CRTE-PDU-CONF":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # Ensure DSCP child mappings are available even when CLI Name cells are blank.
+    section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-fqi"] = "DSCPFQI"
+    section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-ul"] = "DSCPUL"
+    section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-dl"] = "DSCPDL"
+
+    known_params = set(section.param_to_cli.keys())
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    results: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find parameter column in the target-value block.
+        param_col = None
+        best_count = 0
+        for c in range(1, scan_column_limit(ws) + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 220) + 1):
+                if clean_param(ws.cell(r, c).value) in known_params:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None:
+            continue
+
+        parent: Dict[str, Any] = {}
+        children: List[Dict[str, Any]] = []
+        current_child: Optional[Dict[str, Any]] = None
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            if param not in known_params:
+                continue
+
+            raw_value = None
+            for c in range(param_col + 1, scan_column_limit(ws) + 1):
+                candidate = ws.cell(r, c).value
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+                if clean_param(candidate) in known_params:
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+                raw_value = candidate
+                break
+
+            if raw_value is None:
+                continue
+            if clean_cell_value(raw_value) is None:
+                continue
+
+            if param == "pdu-conf-dscp/pdu-conf-dscp-fqi":
+                if current_child:
+                    children.append(current_child)
+                current_child = {param: raw_value}
+            elif param in {
+                "pdu-conf-dscp/pdu-conf-dscp-ul",
+                "pdu-conf-dscp/pdu-conf-dscp-dl",
+            }:
+                if current_child is not None:
+                    current_child[param] = raw_value
+            else:
+                parent[param] = raw_value
+
+        if current_child:
+            children.append(current_child)
+
+        if not parent:
+            continue
+
+        results.append(parent)
+
+        # Find parent ID key for child CHG records.
+        parent_id_key = None
+        for p, cli in section.param_to_cli.items():
+            if cli.upper() == "ID" and p in parent:
+                parent_id_key = p
+                break
+
+        for child in children:
+            rec: Dict[str, Any] = dict(child)
+            if parent_id_key:
+                rec[parent_id_key] = parent[parent_id_key]
+            rec["__ROW_ACTION__"] = "CHG"
+            results.append(rec)
+
+    return results
+
+
+def section_has_unmapped_pdu_dscp_children(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> bool:
+    """PDU-CONF DSCP child mappings are supported."""
+    return False
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
+
+    if section.command.upper() == "CRTE-PDU-CONF":
+        pdu_records = extract_pdu_conf_records(wb_values, section, sections)
+        if pdu_records:
+            return pdu_records
 
     if section.command.upper() == "CRTE-EPC-SNSSAI":
         epc_records = extract_epc_snssai_records(wb_values, section, sections)
@@ -3281,6 +3440,74 @@ def render_cli_line(
 
 
 
+
+
+
+def records_to_pdu_conf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render CRTE-PDU-CONF plus repeated CHG-PDU-CONF DSCP children."""
+    if section.command.upper() != "CRTE-PDU-CONF":
+        return []
+
+    lines: List[str] = []
+    created_ids: set[str] = set()
+
+    chg_order = [
+        "ID", "MODE", "NAME", "PDUTYPE", "PREFTYPE", "NONIP_TYPE", "NEW_PDUTYPE",
+        "SSCMODE", "SELM", "LADN", "LADNACT", "NASCGST", "PDNS4", "SDNS4", "PDNS6",
+        "SDNS6", "PCSCFPF", "MTU", "S6B_GRP_ID", "TUNNEL_UDP_PORT", "FWD4", "FWD6",
+        "FQI", "ARP", "ARPCAP", "ARPVUL", "UAMBR", "DAMBR", "IWEPC", "SUBS_USE",
+        "REDSALW", "PCFPF", "HF", "HCCPF", "RF", "RCCPF", "VF", "VCCPF", "PPI_SUPPORT",
+        "REACT", "QOS_MARK", "ADNN", "IGUEIP", "IGSTATIC", "VNGRP", "ALWAYSON", "DELIWK",
+        "PCF_PRE_IWK", "INACT_SUPP", "INACT_ACT", "INACT_TMR", "ETH_INACT_TMR",
+        "LCALL_TMR", "NIPF", "BUF_CNT", "INACT_ACT_PCF_F", "INACT_TMR_PCF_F",
+        "LCALL_TMR_PCF_F", "DFLT_TMR_SUPP", "DEDI_TMR_SUPP", "ICMP_MTU", "RA_INTERVAL",
+        "RA_COUNT", "RA_LIFETIME", "RA_IDLE_IGN", "BCM", "RVAL", "CRACT", "CRACT_MODE",
+        "RSTOPF", "UPSSUPP", "INTEG", "MAXUL", "RELPREF", "CIPHER", "MAXDL", "ACCT",
+        "ACCT_MODE", "RACCT_ID", "RACCT_URR", "MIRROR_ID", "ACCTINTRM", "ACCTINTV",
+        "AUTH", "AUTH_MODE", "AUTHINFO", "AUTHNAME", "AUTH_PASSWD", "RAUTH_ID", "AUTHBYP",
+        "LCL_QOS", "LQACT", "QMAP", "DSCPFQI", "DSCPUL", "DSCPDL", "DESC"
+    ]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "ID" not in vals:
+            continue
+
+        pdu_id = vals["ID"]
+        is_child = any(k in vals for k in ("DSCPFQI", "DSCPUL", "DSCPDL"))
+
+        if not is_child:
+            if pdu_id in created_ids:
+                continue
+            line = render_cli_line(
+                "CRTE-PDU-CONF",
+                section.cli_order,
+                vals,
+                required_order=section.cli_order,
+            )
+            if line:
+                lines.append(line)
+                created_ids.add(pdu_id)
+            continue
+
+        chg_vals: Dict[str, str] = {
+            "ID": pdu_id,
+            "MODE": "ADD",
+        }
+        for k in ("DSCPFQI", "DSCPUL", "DSCPDL"):
+            if k in vals:
+                chg_vals[k] = vals[k]
+
+        line = render_cli_line(
+            "CHG-PDU-CONF",
+            chg_order,
+            chg_vals,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
 
 
 def records_to_epc_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -4032,6 +4259,14 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         extracted_records = extract_target_records_for_section(wb_values, section, sections)
 
+        if section_has_unmapped_pdu_dscp_children(wb_values, section, sections):
+            warnings.append(
+                f"PDU-CONF section #{idx} contains DSCP child-list Target Values "
+                f"(FQI/UL/DL) but the CIQ source does not provide a TL1 CLI mapping "
+                f"for those child fields; parent CRTE-PDU-CONF is generated, child "
+                f"DSCP rows are not guessed. [{section.sheet_name} row {section.cli_row}]"
+            )
+
         # Generic default-only filtering must also apply to special renderers
         # (NE-GRP, peer service entries, MMERTAL, ACT-LIC, etc.) that do not
         # route through record_to_tl1().
@@ -4049,6 +4284,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-PDU-CONF":
+            lines = records_to_pdu_conf_tl1(section, records)
         elif section.command.upper() == "CRTE-EPC-SNSSAI":
             lines = records_to_epc_snssai_tl1(section, records)
         elif section.command.upper() == "CRTE-SNSSAI":
