@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.138.0"
+SCRIPT_VERSION = "2.139.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -3833,6 +3833,70 @@ def render_cli_line(
 
 
 
+
+def records_to_rbase_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render one CRTE-RBASE per RBID and add repeated RULE children.
+
+    Horizontal Target Values rows commonly use:
+        first row: RBID, NAME, [PREC], [PDRSET], RULE
+        later rows: ↪, ⇢, ⇢, ⇢, RULE
+
+    The first valid RULE stays on CRTE-RBASE. Additional RULE values are
+    emitted as CHG-RBASE with MODE=ADD so a parent rule base is not recreated
+    for every child rule.
+    """
+    if section.command.upper() != "CRTE-RBASE":
+        return []
+
+    lines: List[str] = []
+    created: set[str] = set()
+
+    # Parent create follows the actual CRTE template. PREC may exist in the
+    # parameter table but is intentionally omitted if it is not in cli_order.
+    create_order = list(section.cli_order)
+    chg_order = ["RBID", "MODE", "RULE"]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "RBID" not in vals:
+            continue
+
+        rbid = vals["RBID"]
+
+        if rbid not in created:
+            line = render_cli_line(
+                "CRTE-RBASE",
+                create_order,
+                vals,
+                required_order=create_order,
+            )
+            if line:
+                lines.append(line)
+                created.add(rbid)
+            continue
+
+        # Continuation rows only add RULE. Inherited NAME/PDRSET/etc. must not
+        # be repeated on CHG-RBASE.
+        if "RULE" not in vals:
+            continue
+
+        chg_vals = {
+            "RBID": rbid,
+            "MODE": "ADD",
+            "RULE": vals["RULE"],
+        }
+        line = render_cli_line(
+            "CHG-RBASE",
+            chg_order,
+            chg_vals,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
+
+
 def records_to_pcf_pf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
     """Render PCF-PF parent plus preserved child-list continuation rows."""
     if section.command.upper() != "CRTE-PCF-PF":
@@ -4730,6 +4794,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CRTE-RBASE":
+            lines = records_to_rbase_tl1(section, records)
         elif section.command.upper() == "CRTE-PDU-CONF":
             lines = records_to_pdu_conf_tl1(section, records)
         elif section.command.upper() == "CRTE-PCF-PF":
