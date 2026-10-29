@@ -1,8 +1,8 @@
 # TL1 Generator
 
 **Launch-only GitHub repository package**  
-**Desktop app:** v1.3.37  
-**TL1 engine:** v2.148.0  
+**Desktop app:** v1.3.38  
+**TL1 engine:** v2.149.0  
 **Platforms:** Windows 10/11, macOS, Linux
 
 TL1 Generator converts supported CIQ Excel workbooks into TL1 configuration files. This repository is intentionally designed to run **directly from a GitHub clone, fork, or downloaded ZIP**.
@@ -225,7 +225,7 @@ This GitHub launch package bundles the same TL1 processing engine as the standal
 
 - Standalone/local engine: `excel_to_tl1_generator_v2_103_0.py`
 - GitHub package engine: `tl1_generator/engine.py`
-- Bundled engine version: `2.148.0`
+- Bundled engine version: `2.149.0`
 
 When the TL1 engine is updated, update both the standalone script and `tl1_generator/engine.py` together so local and GitHub launches produce the same output.
 
@@ -247,7 +247,7 @@ This keeps separate runs isolated and prevents output from different executions 
 
 ## Current engine behavior
 
-Bundled TL1 engine: `v2.148.0`
+Bundled TL1 engine: `v2.149.0`
 
 Recent parser improvements include:
 - section-scoped `Out of Scope` detection so a following section cannot incorrectly suppress the current section;
@@ -272,7 +272,7 @@ Every generation is written into a new execution-time folder created by the TL1 
 Both the standalone script and the GitHub GUI use the same engine-level output routing, so neither can bypass the timestamp folder.
 
 
-## Engine v2.148.0 rules
+## Engine v2.149.0 rules
 
 - `CHG-OVLD-CNTL` rows with `SVC="{all services}"` are skipped.
 - `CHG-VES-CNTL` rows with `EVENT={ALL}` are skipped.
@@ -280,7 +280,7 @@ Both the standalone script and the GitHub GUI use the same engine-level output r
 - TL1 files and warnings are written into the same timestamped execution folder.
 
 
-## Engine v2.148.0 default-only rule
+## Engine v2.149.0 default-only rule
 
 The generator skips a configuration record when every assigned **non-key**
 parameter is expressed as a CIQ default wrapper such as:
@@ -301,14 +301,14 @@ The parser also stops at the next CIQ section header so status text such as
 `Complete` cannot leak into the previous section's TL1 output.
 
 
-## Engine v2.148.0 update
+## Engine v2.149.0 update
 
 - `MEAS-KDAY` sections are intentionally skipped from TL1 generation.
 - The skip is written to the warnings report as `Skipped MEAS-KDAY section ...`.
 - TL1 output and the warnings report are generated in the same timestamped execution folder.
 
 
-## Engine v2.148.0 CSDB update
+## Engine v2.149.0 CSDB update
 
 The generator now supports the CSDB layout:
 
@@ -321,7 +321,7 @@ Rows with `csdb-info-single-redun-type=remote` map to `REMOTEIP/REMOTEPORT`.
 Single-value braces around IP addresses are removed automatically.
 
 
-## Engine v2.148.0 GTPC-CAUSE extraction fix
+## Engine v2.149.0 GTPC-CAUSE extraction fix
 
 The GTPC-CAUSE parser now uses a dedicated sequential Target Values extractor.
 This preserves repeated `PROTC` and `GTPCC` child rows and avoids collapsing
@@ -331,7 +331,7 @@ It also ignores the PARAMATERS table's embedded "Target Value" header and starts
 only from the real Target Values block.
 
 
-## Engine v2.148.0 NE-GRP update
+## Engine v2.149.0 NE-GRP update
 
 - Adds a dedicated sequential extractor for `CRTE-NE-GRP`.
 - Each Target Values block becomes one parent group record plus one child record per `NEID`.
@@ -340,7 +340,7 @@ only from the real Target Values block.
 - Generates `CHG-NE-GRP:NE=...,GID=...,MODE=ADD,NEID=...;` for each group member.
 
 
-## Engine v2.148.0 NI-PF update
+## Engine v2.149.0 NI-PF update
 
 - Adds a dedicated extractor for `CRTE-NI-PF`.
 - Ignores `Refer to column ...` guidance in the PARAMATERS table.
@@ -349,7 +349,7 @@ only from the real Target Values block.
 - Generates one `CRTE-NI-PF` command for every `INTF_TYPE/NI` mapping.
 
 
-## Engine v2.148.0 NI-PF correction
+## Engine v2.149.0 NI-PF correction
 
 For each NI-PF ID:
 - the first `INTF_TYPE/NI` mapping generates `CRTE-NI-PF`;
@@ -357,7 +357,7 @@ For each NI-PF ID:
 - `NAME` is only included on the create line.
 
 
-## Engine v2.148.0 NE-GRP PCRF fix
+## Engine v2.149.0 NE-GRP PCRF fix
 
 - NE-GRP extraction no longer stops on unsupported-but-valid rows such as
   `ne-group-minu`, `ne-group-grpadm`, and `ne-group-use`.
@@ -366,7 +366,7 @@ For each NI-PF ID:
 - PCRF and UPF NE-GRP structures were both regression-tested.
 
 
-## Engine v2.148.0 NE-GRP correction
+## Engine v2.149.0 NE-GRP correction
 
 For each NE-GRP group:
 - the first child member is included directly on the `CRTE-NE-GRP` line;
@@ -374,7 +374,7 @@ For each NE-GRP group:
 - parent fields such as `TMR` and `MAXCHG` remain on the create line.
 
 
-## Engine v2.148.0 peer-service fix
+## Engine v2.149.0 peer-service fix
 
 - Adds a dedicated sequential extractor for UDM/AUSF/NRF/SMF/PCF-style peer service tables.
 - Preserves every `SVC`, `SCHEME`, `SVCIP`, and `SVCPORT` entry instead of collapsing repeated child rows.
@@ -383,7 +383,7 @@ For each NE-GRP group:
 - Repeated `SCHEME` is omitted for the second+ IP of the same service.
 
 
-## Engine v2.148.0 AMF peer fix
+## Engine v2.149.0 AMF peer fix
 
 - Adds AMF-specific sequential extraction.
 - Keeps parent AMF fields, GUAMI fields, S-NSSAI fields, and service/IP fields in separate contexts.
@@ -391,7 +391,7 @@ For each NE-GRP group:
 - Preserves the generic peer-service behavior for service/IP continuation rows.
 
 
-## Engine v2.148.0 SNSSAI update
+## Engine v2.149.0 SNSSAI update
 
 - Adds dedicated sequential extraction for `CRTE-SNSSAI`.
 - Preserves repeated `DNN/PDUCONF/INH` child mappings.
@@ -400,13 +400,13 @@ For each NE-GRP group:
 - Skips DNN child groups explicitly marked excluded (`X` / cross marker).
 
 
-## Engine v2.148.0 SNSSAI ordering correction
+## Engine v2.149.0 SNSSAI ordering correction
 
 For `CHG-SNSSAI-INF`, `MODE=ADD` is enforced immediately before `DNN`,
 with `PDUCONF` and `INH` after `DNN`.
 
 
-## Engine v2.148.0 performance improvements
+## Engine v2.149.0 performance improvements
 
 - Adds `TL1_SCAN_MAX_COLUMNS` with a default scan cap of 256 columns.
 - Avoids repeatedly scanning formatting-inflated worksheet columns.
@@ -419,7 +419,7 @@ Set `TL1_SCAN_MAX_COLUMNS=0` to restore full-column scanning if a workbook
 legitimately stores CIQ configuration data beyond column 256.
 
 
-## Engine v2.148.0 SNSSAI target-value correction
+## Engine v2.149.0 SNSSAI target-value correction
 
 - SNSSAI comparison/status markers such as `✓` and `🗙` no longer control
   whether a Target Value is generated.
@@ -428,7 +428,7 @@ legitimately stores CIQ configuration data beyond column 256.
 - Existing `[ENC]`, `SKIP`, and other explicit skip rules remain unchanged.
 
 
-## Engine v2.148.0 EPC-SNSSAI fix
+## Engine v2.149.0 EPC-SNSSAI fix
 
 - Adds dedicated horizontal extraction for EPC-SNSSAI Target Values tables.
 - Preserves parent `ID/NAME/SNSSAI` separately from child `DNN/SNSSAI`.
@@ -438,7 +438,7 @@ legitimately stores CIQ configuration data beyond column 256.
 - `[ENC]` child fields remain omitted.
 
 
-## Engine v2.148.0 EPC-SNSSAI ordering correction
+## Engine v2.149.0 EPC-SNSSAI ordering correction
 
 For every `CHG-EPC-SNSSAI` command, the order is explicitly enforced as:
 
@@ -450,7 +450,7 @@ This guarantees `MODE=ADD` appears before `DNN`, with `SNSSAI` and other
 child parameters after `DNN`.
 
 
-## Engine v2.148.0 generic brace-value normalization
+## Engine v2.149.0 generic brace-value normalization
 
 TL1 values wrapped in braces are normalized globally:
 
@@ -464,7 +464,7 @@ The rule is applied before existing command-specific case formatting, so
 existing lowercase/uppercase handling remains in effect.
 
 
-## Engine v2.148.0 PDU-CONF brace/default normalization
+## Engine v2.149.0 PDU-CONF brace/default normalization
 
 - Normalizes `{value}` and `{a,b}` during cell cleaning as well as final formatting.
 - `[default = {1}]` becomes `1`.
@@ -473,7 +473,7 @@ existing lowercase/uppercase handling remains in effect.
 - If PDU-CONF contains unmapped DSCP child rows (`FQI/UL/DL`), the tool writes a warning instead of silently discarding them or inventing TL1 syntax.
 
 
-## Engine v2.148.0 PDU-CONF DSCP child-list support
+## Engine v2.149.0 PDU-CONF DSCP child-list support
 
 - Maps `pdu-conf-dscp/pdu-conf-dscp-fqi` to `DSCPFQI`.
 - Maps `pdu-conf-dscp/pdu-conf-dscp-ul` to `DSCPUL`.
@@ -485,7 +485,7 @@ existing lowercase/uppercase handling remains in effect.
 - `MODE=ADD` is explicitly placed before the DSCP child parameters.
 
 
-## Engine v2.148.0 multi-block and damaged-label recovery
+## Engine v2.149.0 multi-block and damaged-label recovery
 
 - Each real `Target Values` block is now bounded at the next real marker.
 - Embedded/corrupted rows containing the words `Target Values` plus an actual value
@@ -501,7 +501,7 @@ existing lowercase/uppercase handling remains in effect.
 - PCF-ERR horizontal continuation rows now inherit PFID correctly.
 
 
-## Engine v2.148.0 RBASE repeated RULE handling
+## Engine v2.149.0 RBASE repeated RULE handling
 
 - Treats `CRTE-RBASE` Target Values as one parent rule base per `RBID`.
 - Keeps the first valid `RULE` on the parent `CRTE-RBASE`.
@@ -514,7 +514,7 @@ existing lowercase/uppercase handling remains in effect.
 - `[ENC]` PDRSET values remain omitted.
 
 
-## Engine v2.148.0 NAME / DESC case preservation
+## Engine v2.149.0 NAME / DESC case preservation
 
 - Values assigned to `NAME` preserve the exact source capitalization.
 - Values assigned to `DESC` preserve the exact source capitalization.
@@ -522,7 +522,7 @@ existing lowercase/uppercase handling remains in effect.
 - Existing special case rules for DNN, KEY, SVC, HOST, REALM, etc. remain unchanged.
 
 
-## Engine v2.148.0 CHA-RULE positional recovery
+## Engine v2.149.0 CHA-RULE positional recovery
 
 - Adds dedicated `CRTE-CHA-RULE` extraction.
 - Processes each real Target Values block as exactly one charging-rule record.
@@ -532,7 +532,7 @@ existing lowercase/uppercase handling remains in effect.
 - Prevents malformed output such as `RPT=CHA-RULE-*`, `SID=CHA-RULE-*`, or parentless `CRTE-CHA-RULE:SID=...`.
 
 
-## Engine v2.148.0 nested default-wrapper normalization
+## Engine v2.149.0 nested default-wrapper normalization
 
 Default values with trailing nested annotations are normalized before TL1 rendering:
 
@@ -546,7 +546,7 @@ Existing default handling remains supported, including `[default = {1}]`,
 NAME and DESC still preserve their source capitalization.
 
 
-## Engine v2.148.0 ONC-RCODE MODE handling
+## Engine v2.149.0 ONC-RCODE MODE handling
 
 - `CHG-ONC-RCODE` now always includes mandatory `MODE=ADD`.
 - Output order is enforced as:
@@ -557,7 +557,7 @@ NAME and DESC still preserve their source capitalization.
   `ID,TYPE,[USED],[VAL]`.
 
 
-## Engine v2.148.0 charging dictionary/event input cleanup
+## Engine v2.149.0 charging dictionary/event input cleanup
 
 - CIQ helper text such as `Refer to column B below.` and `See value below.`
   is no longer treated as configuration data.
@@ -568,7 +568,7 @@ NAME and DESC still preserve their source capitalization.
 - OFC-DICT and LNK-URR continue using their existing conditioned/horizontal mappings.
 
 
-## Engine v2.148.0 SUPP-LMT target-table handling
+## Engine v2.149.0 SUPP-LMT target-table handling
 
 - Adds dedicated parsing for `CHG-SUPP-LMT:[CODE],LMT`.
 - Maps `fault-code` to `CODE`.
@@ -579,7 +579,7 @@ NAME and DESC still preserve their source capitalization.
 - Prevents helper/header values such as `SUPP-LIMIT` from becoming `CODE` values.
 
 
-## Engine v2.148.0 APRSC-LMT support
+## Engine v2.149.0 APRSC-LMT support
 
 - Adds dedicated parsing for `CRTE-APRSC-LMT:RSC,CRIA,CRIC,MAJA,MAJC,MINA,MINC,[DESC]`.
 - Maps:
@@ -596,7 +596,7 @@ NAME and DESC still preserve their source capitalization.
 - Optional `DESC` is preserved only when actually present in the target data.
 
 
-## Engine v2.148.0 SUPP-LMT default-only filtering
+## Engine v2.149.0 SUPP-LMT default-only filtering
 
 - `CHG-SUPP-LMT` now follows the generic default-only rule.
 - A row such as `CODE=200, LMT=[default = 10]` is skipped.
@@ -605,8 +605,15 @@ NAME and DESC still preserve their source capitalization.
   Target Values side of the table, before the duplicated Current Values area.
 
 
-## Engine v2.148.0 CHG-VES-CNTL ALL-event suppression
+## Engine v2.149.0 CHG-VES-CNTL ALL-event suppression
 
 - `CHG-VES-CNTL` rows are skipped when `EVENT=ALL`.
 - The existing braced variant `EVENT={ALL}` is also skipped.
 - Other event values continue to generate normally.
+
+
+## Engine v2.149.0 IFNAME case preservation
+
+- Values assigned to `IFNAME` now preserve their exact source capitalization.
+- Existing case-preservation rules for `NAME`, `DESC`, `APN`, `FQDN`, etc. remain unchanged.
+- Other parameters continue to follow their existing uppercase/lowercase normalization rules.
