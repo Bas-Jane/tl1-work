@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.163.0"
+SCRIPT_VERSION = "2.166.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -278,6 +278,20 @@ def is_status(value: Any) -> bool:
     return as_text(value) in STATUS_VALUES
 
 
+
+def is_struck_value(value: Any) -> bool:
+    """Return True for source values marked as struck-through text.
+
+    Pasted/flattened CIQ data may represent Excel strikethrough as:
+      ~~930~~
+      ~~↪~~
+      ~~⇢~~
+    Such target values are intentionally excluded from generated TL1.
+    """
+    s = as_text(value).strip()
+    return len(s) >= 4 and s.startswith("~~") and s.endswith("~~")
+
+
 def is_arrow_value(value: Any) -> bool:
     """Return True for CIQ ditto/carry-forward markers."""
     text = as_text(value).strip()
@@ -427,6 +441,9 @@ def clean_cell_value(value: Any) -> Optional[str]:
         return None
 
     if is_reference_helper_value(value):
+        return None
+
+    if is_struck_value(value):
         return None
 
     if isinstance(value, float) and value.is_integer():
@@ -2332,6 +2349,245 @@ def extract_epc_snssai_records(
 
 
 
+
+
+def extract_pdi_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PDI-INF parent records and FLTRID child lists.
+
+    Source fields:
+      packet-detection-info-id               -> PDIID
+      packet-detection-info-source-interface -> ignored (no CLI field)
+      packet-detection-info-description      -> DESC
+      packet-detection-info-appid            -> APPID
+      packet-detection-info-fltr-list        -> FLTRID child list
+
+    The source filter list may contain one or many values in braces.
+    Comparison markers such as 🗙 never suppress valid target values.
+    """
+    if section.command.upper() != "CRTE-PDI":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    aliases = {
+        "packet-detection-info-id": "PDIID",
+        "packet-detection-info-description": "DESC",
+        "packet-detection-info-appid": "APPID",
+        "packet-detection-info-fltr-list": "FLTRID",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    # Ensure source-interface is never inferred into the CLI.
+    section.param_to_cli.pop("packet-detection-info-source-interface", None)
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+        start_col, end_col = target_column_bounds(ws, marker_row, marker_col)
+
+        header_row = None
+        cols: Dict[str, int] = {}
+
+        # The target table includes source-interface even though it has no TL1
+        # CLI name. Find all five source columns by source parameter name.
+        expected_headers = {
+            "packet-detection-info-id",
+            "packet-detection-info-source-interface",
+            "packet-detection-info-description",
+            "packet-detection-info-appid",
+            "packet-detection-info-fltr-list",
+        }
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[str, int] = {}
+            for c in range(start_col, end_col + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in expected_headers and p not in found:
+                    found[p] = c
+            if "packet-detection-info-id" in found and \
+               "packet-detection-info-fltr-list" in found:
+                header_row = r
+                cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        for r in range(header_row + 1, end_row + 1):
+            id_raw = ws.cell(r, cols["packet-detection-info-id"]).value
+            if is_blank(id_raw) or is_status(id_raw) or is_struck_value(id_raw):
+                continue
+
+            cleaned_id = clean_cell_value(id_raw)
+            if cleaned_id in {None, ""}:
+                continue
+
+            rec: Dict[str, Any] = {
+                "packet-detection-info-id": id_raw,
+            }
+
+            for param in (
+                "packet-detection-info-description",
+                "packet-detection-info-appid",
+                "packet-detection-info-fltr-list",
+            ):
+                col = cols.get(param)
+                if not col:
+                    continue
+                raw = ws.cell(r, col).value
+                if is_blank(raw) or is_status(raw) or is_struck_value(raw):
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+
+            records.append(rec)
+
+    return records
+
+
+def extract_pdr_set_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PDR-SET parent rows and repeated PDR child indices.
+
+    Each target block contains:
+      ID, NAME, DESC, PDR
+
+    Continuation rows use arrow markers for the parent fields. The returned
+    records contain the inherited parent context plus one valid PDR per row.
+    Struck-through PDR values are omitted. Comparison markers such as 🗙 do
+    not suppress a valid target PDR.
+    """
+    if section.command.upper() != "CRTE-PDR-SET":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    aliases = {
+        "packet-detection-rule-set-id": "ID",
+        "packet-detection-rule-set-name": "NAME",
+        "packet-detection-rule-set-description": "DESC",
+        "packet-detection-rule-set-pdr-list-entry/packet-detection-rule-set-pdr-index": "PDR",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    if not markers:
+        return []
+
+    all_records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+        start_col, end_col = target_column_bounds(ws, marker_row, marker_col)
+
+        header_row = None
+        param_cols: Dict[str, int] = {}
+
+        # Locate the target-side header. Use the first occurrence of each alias
+        # so duplicated Current Values columns are never consumed.
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[str, int] = {}
+            for c in range(start_col, end_col + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in aliases and p not in found:
+                    found[p] = c
+            if "packet-detection-rule-set-id" in found and \
+               "packet-detection-rule-set-pdr-list-entry/packet-detection-rule-set-pdr-index" in found:
+                header_row = r
+                param_cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        current_id = None
+        current_name = None
+        current_desc = None
+        blank_run = 0
+
+        for r in range(header_row + 1, end_row + 1):
+            id_raw = ws.cell(r, param_cols["packet-detection-rule-set-id"]).value
+            name_raw = ws.cell(r, param_cols.get("packet-detection-rule-set-name")).value if "packet-detection-rule-set-name" in param_cols else None
+            desc_raw = ws.cell(r, param_cols.get("packet-detection-rule-set-description")).value if "packet-detection-rule-set-description" in param_cols else None
+            pdr_raw = ws.cell(r, param_cols["packet-detection-rule-set-pdr-list-entry/packet-detection-rule-set-pdr-index"]).value
+
+            row_values = [id_raw, name_raw, desc_raw, pdr_raw]
+            if all(is_blank(v) for v in row_values):
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            # A real parent row supplies a new explicit ID. Arrow/struck values
+            # mean continue the existing parent context.
+            if not is_blank(id_raw) and not is_arrow_value(id_raw) and not is_struck_value(id_raw):
+                cleaned_id = clean_cell_value(id_raw)
+                if cleaned_id is not None and cleaned_id != "":
+                    current_id = id_raw
+
+                    if not is_blank(name_raw) and not is_arrow_value(name_raw) and not is_struck_value(name_raw):
+                        cleaned_name = clean_cell_value(name_raw)
+                        if cleaned_name is not None:
+                            current_name = name_raw
+
+                    if not is_blank(desc_raw) and not is_arrow_value(desc_raw) and not is_struck_value(desc_raw):
+                        cleaned_desc = clean_cell_value(desc_raw)
+                        if cleaned_desc is not None:
+                            current_desc = desc_raw
+
+            if current_id is None:
+                continue
+
+            # PDR is the child value for every valid row, including the first
+            # parent row. Ignore explicit strikethrough values.
+            if is_blank(pdr_raw) or is_arrow_value(pdr_raw) or is_struck_value(pdr_raw):
+                continue
+            cleaned_pdr = clean_cell_value(pdr_raw)
+            if cleaned_pdr is None or cleaned_pdr == "":
+                continue
+
+            rec: Dict[str, Any] = {
+                "packet-detection-rule-set-id": current_id,
+                "packet-detection-rule-set-pdr-list-entry/packet-detection-rule-set-pdr-index": pdr_raw,
+            }
+            if current_name is not None:
+                rec["packet-detection-rule-set-name"] = current_name
+            if current_desc is not None:
+                rec["packet-detection-rule-set-description"] = current_desc
+            all_records.append(rec)
+
+    return all_records
+
+
 def extract_snssai_records_upf_horizontal(
     wb_values,
     section: Section,
@@ -2376,7 +2632,6 @@ def extract_snssai_records_upf_horizontal(
 
     for p, cli in aliases.items():
         section.param_to_cli[p] = cli
-    section.param_to_cli["__snssai__"] = "SNSSAI"
 
     records: List[Dict[str, Any]] = []
 
@@ -2444,18 +2699,12 @@ def extract_snssai_records_upf_horizontal(
                 next_r += 1
 
             sst = clean_cell_value(rec.get("upf-snssai-sst"))
-            sd = clean_cell_value(rec.get("upf-snssai-sd"))
             if not sst:
                 r = max(next_r, r + 1)
                 continue
 
-            sd_text = as_text(sd).strip()
-            if not sd_text or sd_text.lower() == "none":
-                rec["__snssai__"] = as_text(sst).strip()
-            else:
-                # Match existing hex normalization behavior downstream.
-                rec["__snssai__"] = f"{as_text(sst).strip()}-{sd_text}"
-
+            # Do not synthesize SNSSAI for this UPF layout. The source
+            # explicitly provides SST, optional SD, DNNNAME and DESC only.
             records.append(rec)
             r = max(next_r, r + 1)
 
@@ -4484,6 +4733,16 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         if epc_records:
             return epc_records
 
+    if section.command.upper() == "CRTE-PDI":
+        pdi_records = extract_pdi_records(wb_values, section, sections)
+        if pdi_records:
+            return pdi_records
+
+    if section.command.upper() == "CRTE-PDR-SET":
+        pdr_set_records = extract_pdr_set_records(wb_values, section, sections)
+        if pdr_set_records:
+            return pdr_set_records
+
     if section.command.upper() == "CRTE-SNSSAI":
         snssai_records = extract_snssai_records(wb_values, section, sections)
         if snssai_records:
@@ -4838,6 +5097,136 @@ def records_to_onc_rcode_tl1(section: Section, records: List[Dict[str, Any]]) ->
     return lines
 
 
+
+
+def records_to_pdi_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render PDI parent plus FLTRID children.
+
+    Parent:
+      CRTE-PDI:PDIID,[APPID],[DESC];
+
+    Child:
+      CHG-PDI-INF:PDIID,TYPE=ADD,FLTRID=<id>;
+
+    One child command is emitted per filter ID.
+    """
+    if section.command.upper() != "CRTE-PDI":
+        return []
+
+    lines: List[str] = []
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "PDIID" not in vals:
+            continue
+
+        pdiid = vals["PDIID"]
+
+        create_vals: Dict[str, str] = {"PDIID": pdiid}
+        if "APPID" in vals:
+            create_vals["APPID"] = vals["APPID"]
+        if "DESC" in vals:
+            create_vals["DESC"] = vals["DESC"]
+
+        create_line = render_cli_line(
+            "CRTE-PDI",
+            ["PDIID", "APPID", "DESC"],
+            create_vals,
+            required_order=["PDIID", "APPID", "DESC"],
+        )
+        if create_line:
+            lines.append(create_line)
+
+        fltr_raw = vals.get("FLTRID")
+        if not fltr_raw:
+            continue
+
+        # clean_cell_value / brace normalization may already have converted
+        # {980, 981} to 980&981. Also accept commas/newlines defensively.
+        fltr_text = as_text(fltr_raw).strip().strip('"')
+        fltr_parts = [
+            p.strip()
+            for p in re.split(r"[&,\n]+", fltr_text)
+            if p.strip()
+        ]
+
+        for fltrid in fltr_parts:
+            chg_vals = {
+                "PDIID": pdiid,
+                "TYPE": "ADD",
+                "FLTRID": format_tl1_value("FLTRID", fltrid, "CHG-PDI-INF"),
+            }
+            chg_line = render_cli_line(
+                "CHG-PDI-INF",
+                ["PDIID", "TYPE", "FLTRID"],
+                chg_vals,
+                required_order=["PDIID", "TYPE", "FLTRID"],
+            )
+            if chg_line:
+                lines.append(chg_line)
+
+    return lines
+
+
+def records_to_pdr_set_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render each PDR-SET once, then add every PDR child with TYPE=ADD.
+
+    Example:
+      CRTE-PDR-SET:ID=1,NAME=Gy_mobile_rb,DESC=Gy_mobile_rb;
+      CHG-PDR-SET:ID=1,TYPE=ADD,PDR=1;
+      CHG-PDR-SET:ID=1,TYPE=ADD,PDR=5;
+    """
+    if section.command.upper() != "CRTE-PDR-SET":
+        return []
+
+    lines: List[str] = []
+    created: set[str] = set()
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "ID" not in vals:
+            continue
+
+        pdr_set_id = vals["ID"]
+
+        if pdr_set_id not in created:
+            create_vals: Dict[str, str] = {"ID": pdr_set_id}
+            if "NAME" in vals:
+                create_vals["NAME"] = vals["NAME"]
+            if "DESC" in vals:
+                create_vals["DESC"] = vals["DESC"]
+
+            create_line = render_cli_line(
+                "CRTE-PDR-SET",
+                ["ID", "NAME", "DESC"],
+                create_vals,
+                required_order=["ID", "NAME", "DESC"],
+            )
+            if create_line:
+                lines.append(create_line)
+                created.add(pdr_set_id)
+
+        # Every valid PDR, including the first row's PDR, is a child addition.
+        if "PDR" not in vals:
+            continue
+
+        chg_vals = {
+            "ID": pdr_set_id,
+            "TYPE": "ADD",
+            "PDR": vals["PDR"],
+        }
+        chg_line = render_cli_line(
+            "CHG-PDR-SET",
+            ["ID", "TYPE", "PDR"],
+            chg_vals,
+            required_order=["ID", "TYPE", "PDR"],
+        )
+        if chg_line:
+            lines.append(chg_line)
+
+    return lines
+
+
 def records_to_rbase_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
     """Render one CRTE-RBASE per RBID and add repeated RULE children.
 
@@ -5127,12 +5516,14 @@ def records_to_snssai_tl1(section: Section, records: List[Dict[str, Any]]) -> Li
     lines: List[str] = []
     # UPF SNSSAI-INF uses a different CLI shape:
     # CRTE-SNSSAI:[SNSSAI],SST,[SD],[DNN],[DNNNAME],[DESC];
+    # SNSSAI is optional in the CLI and is not present in this source layout,
+    # so never derive or require it.
     if "SNSSAI" in {x.upper() for x in section.cli_order} and "DNNNAME" in {x.upper() for x in section.cli_order}:
         upf_lines: List[str] = []
         order = ["SNSSAI", "SST", "SD", "DNN", "DNNNAME", "DESC"]
         for rec in records:
             vals = record_to_cli_values(section, rec, keep_arrows=False)
-            if not vals or "SNSSAI" not in vals or "SST" not in vals:
+            if not vals or "SST" not in vals:
                 continue
             line = render_cli_line(
                 "CRTE-SNSSAI",
@@ -5829,6 +6220,10 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
             lines = records_to_ofc_evt_tl1(section, records)
         elif section.command.upper() == "CHG-ONC-RCODE":
             lines = records_to_onc_rcode_tl1(section, records)
+        elif section.command.upper() == "CRTE-PDI":
+            lines = records_to_pdi_tl1(section, records)
+        elif section.command.upper() == "CRTE-PDR-SET":
+            lines = records_to_pdr_set_tl1(section, records)
         elif section.command.upper() == "CRTE-RBASE":
             lines = records_to_rbase_tl1(section, records)
         elif section.command.upper() == "CRTE-PDU-CONF":
