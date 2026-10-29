@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.140.0"
+SCRIPT_VERSION = "2.141.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -3557,6 +3557,102 @@ def extract_pcf_pf_records(
     return results
 
 
+
+def extract_cha_rule_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract one CHA-RULE record per real Target Values block.
+
+    This parser is intentionally positional. If a target block has shifted or
+    damaged parameter labels, values are aligned to the Parameters-table order
+    rather than being assigned to the wrong CLI names.
+
+    It also relies on real Target Values block boundaries, so a corrupted data
+    row containing the literal text "Target Values (B1C3)" does not become a
+    new configuration object.
+    """
+    if section.command.upper() != "CRTE-CHA-RULE":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    entries = parameter_table_entries(ws, section, next_cli_row)
+    param_order = [p for p, _typ, _cli in entries]
+    known_params = set(section.param_to_cli.keys()) | set(param_order)
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find the dominant target-side parameter-name column.
+        param_col = None
+        best_count = 0
+        for c in range(1, scan_column_limit(ws) + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 40) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in known_params:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None:
+            continue
+
+        # Collect all rows containing a target value. Preserve [ENC] rows in
+        # the sequence so following values do not shift to earlier parameters.
+        target_rows: List[Tuple[int, Any]] = []
+        for r in range(marker_row + 1, end_row + 1):
+            raw = target_value_from_vertical_row(ws, r, param_col, known_params)
+            if raw is None:
+                continue
+            target_rows.append((r, raw))
+
+        if not target_rows:
+            continue
+
+        rec: Dict[str, Any] = {}
+        pos = 0
+
+        for r, raw_value in target_rows:
+            if pos >= len(param_order):
+                break
+
+            expected_param = param_order[pos]
+            cleaned = clean_cell_value(raw_value)
+
+            # Store valid values, but always advance the positional slot.
+            if cleaned is not None:
+                rec[expected_param] = raw_value
+            pos += 1
+
+        # Require the key CHAID. Empty placeholder blocks are ignored.
+        chaid_param = next(
+            (p for p, cli in section.param_to_cli.items()
+             if cli.upper() == "CHAID" and p in rec),
+            None,
+        )
+        if not chaid_param:
+            continue
+        if clean_cell_value(rec.get(chaid_param)) in {None, ""}:
+            continue
+
+        records.append(rec)
+
+    return records
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
@@ -3565,6 +3661,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CRTE-CHA-RULE":
+        cha_rule_records = extract_cha_rule_records(wb_values, section, sections)
+        if cha_rule_records:
+            return cha_rule_records
 
     if section.command.upper() == "CRTE-PCF-PF":
         pcf_records = extract_pcf_pf_records(wb_values, section, sections)
