@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.156.0"
+SCRIPT_VERSION = "2.159.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -582,17 +582,6 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
         normalized = "&".join(p.upper() for p in parts)
         return quote_if_needed(normalized)
 
-    # Generic comma-separated parameter lists use '&' in TL1.
-    # Example:
-    #   PARAM=xxx,xxx,xxx -> PARAM=XXX&XXX&XXX
-    #
-    # Command-specific handlers above take precedence. DESC is excluded because
-    # commas can be normal punctuation in free-text descriptions.
-    if cli != "DESC" and "," in value:
-        parts = [part.strip() for part in value.split(",")]
-        parts = [part for part in parts if part]
-        if len(parts) > 1:
-            value = "&".join(parts)
 
     # Keep prior important case-sensitive fields stable when this simplified
     # script is used directly.
@@ -601,6 +590,23 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
         "NAME", "DESC", "IFNAME",
     }
     lower_case = {"SVC", "HOST", "REALM"}
+    # Generic comma-separated parameter lists use '&' in TL1 and are quoted
+    # as one string value.
+    # Example:
+    #   PARAM=xxx,xxx,xxx -> PARAM="XXX&XXX&XXX"
+    #
+    # Command-specific handlers above take precedence. DESC is excluded because
+    # commas can be normal punctuation in free-text descriptions.
+    if cli != "DESC" and "," in value:
+        parts = [part.strip() for part in value.split(",")]
+        parts = [part for part in parts if part]
+        if len(parts) > 1:
+            normalized_list = "&".join(parts)
+            if cli in preserve_case:
+                return f'"{normalized_list}"'
+            if cli in lower_case:
+                return f'"{normalized_list.lower()}"'
+            return f'"{normalized_list.upper()}"'
     if cli in preserve_case:
         return quote_if_needed(value)
     if cli in lower_case:
@@ -3712,6 +3718,114 @@ def extract_onc_dict_records(
 
 
 
+
+def extract_gr_bgp_rpc_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract GR-BGP RPC-style target rows.
+
+    Example title:
+        RPC: Change Local ASPL (GR-BGP:ASPL)
+
+    Example source target:
+        local-aspath-len -> ASPATH_LEN
+
+    The GR-BGP object ID is inherited from the most recently generated
+    preceding `CHG-GR-BGP:ID=...` command in workbook/section order.
+    The extractor emits a placeholder which build_tl1_output resolves after
+    the previous GR-BGP line is known.
+    """
+    if section.command.upper() != "CHG-GR-BGP":
+        return []
+
+    title = section.title or ""
+    if not re.search(r"\bRPC\b", title, flags=re.I):
+        return []
+
+    gr_id = "__PREV_GR_BGP_ID__"
+
+    # Known RPC input aliases.
+    alias_map = {
+        "local-aspath-len": "ASPATH_LEN",
+        "local-aspath-max": "ASPATH_MAX",
+        "local-aspath-gap": "ASPATH_GAP",
+        "filter-status": "FLT_STS",
+        "flt-sts": "FLT_STS",
+    }
+
+    for param, cli in alias_map.items():
+        section.param_to_cli[param] = cli
+
+    # Synthetic mapping for the previous generated GR-BGP ID.
+    synthetic_id_param = "__gr_bgp_id__"
+    section.param_to_cli[synthetic_id_param] = "ID"
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+        target_start_col, target_end_col = target_column_bounds(
+            ws, marker_row, marker_col
+        )
+
+        # Find a horizontal header row containing at least one known GR-BGP input.
+        header_row = None
+        header_cols: Dict[str, int] = {}
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[str, int] = {}
+            for c in range(target_start_col, target_end_col + 1):
+                p = clean_param(ws.cell(r, c).value).lower()
+                if p in alias_map and p not in found:
+                    found[p] = c
+            if found:
+                header_row = r
+                header_cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            rec: Dict[str, Any] = {synthetic_id_param: gr_id}
+            found_value = False
+
+            for param, col in header_cols.items():
+                raw = ws.cell(r, col).value
+                if is_blank(raw):
+                    continue
+                if is_status(raw) or is_reference_helper_value(raw):
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+                found_value = True
+
+            if not found_value:
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+
+            blank_run = 0
+            records.append(rec)
+
+    return records
+
+
 def extract_cndb_records(
     wb_values,
     section: Section,
@@ -4098,6 +4212,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CHG-GR-BGP":
+        gr_bgp_records = extract_gr_bgp_rpc_records(wb_values, section, sections)
+        if gr_bgp_records:
+            return gr_bgp_records
 
     if section.command.upper() == "CRTE-CNDB":
         cndb_records = extract_cndb_records(wb_values, section, sections)
@@ -5392,6 +5511,7 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
     sections = discover_sections(wb_values, selected_sheets)
     output_blocks: List[str] = []
     warnings: List[str] = []
+    last_gr_bgp_id: Optional[str] = None
 
     for idx, section in enumerate(sections, start=1):
         if selected_section_numbers and idx not in selected_section_numbers:
@@ -5489,6 +5609,35 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
                         lines.append(line)
                     if row_num % 50000 == 0:
                         print(f"  Rendered {row_num:,} records for section #{idx}...")
+
+        # GR-BGP RPC sections inherit ID from the previously generated
+        # CHG-GR-BGP line. Never derive the ID from the RPC title.
+        if section.command.upper() == "CHG-GR-BGP" and re.search(r"\bRPC\b", section.title or "", flags=re.I):
+            placeholder = "__PREV_GR_BGP_ID__"
+            if any(placeholder in line for line in lines):
+                if last_gr_bgp_id:
+                    lines = [line.replace(placeholder, last_gr_bgp_id) for line in lines]
+                else:
+                    lines = []
+                    warnings.append(
+                        f"Skipped GR-BGP RPC section #{idx}: no previous "
+                        f"CHG-GR-BGP:ID=... value was available to inherit "
+                        f"[{section.sheet_name} row {section.cli_row}]"
+                    )
+
+        # Track the latest generated GR-BGP ID for following RPC sections.
+        if section.command.upper() == "CHG-GR-BGP" and lines:
+            for generated_line in reversed(lines):
+                m_gr_id = re.search(
+                    r"^CHG-GR-BGP:ID=([^,;]+)",
+                    generated_line,
+                    flags=re.I,
+                )
+                if m_gr_id:
+                    candidate_id = m_gr_id.group(1).strip()
+                    if candidate_id and candidate_id != "__PREV_GR_BGP_ID__":
+                        last_gr_bgp_id = candidate_id
+                        break
 
         if lines:
             block = [f"### {section.title}"] + lines
