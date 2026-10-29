@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.166.0"
+SCRIPT_VERSION = "2.171.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -44,7 +44,10 @@ MAX_BLANK_ROWS_IN_TARGET_TABLE = 25
 
 SKIP_VALUES = {
     "[tbd]", "[st-input]", "[telus-input]", "[enc]", "tbd", "skip", "n/a",
-    "[ignore-keys]", "ignore-keys"}
+    "[ignore-keys]", "ignore-keys"    "entry1",
+    "[TBD]",
+    "TBD",
+}
 STATUS_VALUES = {"✓", "◌", "🗙", "↞", "⯑"}
 TARGET_RE = re.compile(r"\btarget\s+values?\b", re.I)
 CURRENT_RE = re.compile(r"\bcurrent\s+values?\b", re.I)
@@ -270,8 +273,24 @@ def is_blank(value: Any) -> bool:
 
 
 def is_skip_value(value: Any) -> bool:
+    """Return True for placeholder/skip values that must not be emitted."""
     s = norm_key(value)
-    return s in SKIP_VALUES or s.startswith("skip")
+    if not s:
+        return False
+
+    # Global placeholders requested for all parameters.
+    if s in {"entry1", "[tbd]", "tbd"}:
+        return True
+
+    # Existing skip semantics.
+    if s in {norm_key(v) for v in SKIP_VALUES}:
+        return True
+
+    # Preserve broader SKIP matching behavior.
+    if re.fullmatch(r"\[?\s*skip\s*\]?", s, flags=re.I):
+        return True
+
+    return False
 
 
 def is_status(value: Any) -> bool:
@@ -514,6 +533,11 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
 
+    # DNS_HOST_NAME is case-sensitive source text. Preserve it exactly and
+    # only apply the normal quoting rule when whitespace is present.
+    if cli == "DNS_HOST_NAME":
+        return quote_if_needed(as_text(value).strip())
+
     # CRTE-SNSSAI DNNNAME is a leaf-list. Source may use braces, commas,
     # and embedded line breaks; TL1 expects one quoted ampersand-separated list.
     if cmd == "CRTE-SNSSAI" and cli == "DNNNAME":
@@ -615,7 +639,7 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     # script is used directly.
     preserve_case = {
         "NFID", "FQDN", "SVCID", "INSTID", "PGWFQDN", "DFTDNN", "APN",
-        "NAME", "DESC", "IFNAME", "NINAME",
+        "NAME", "DESC", "IFNAME", "NINAME", "URL", "DNS_HOST_NAME",
     }
     lower_case = {"SVC", "HOST", "REALM"}
     # Generic comma-separated parameter lists use '&' in TL1 and are quoted
@@ -3073,6 +3097,102 @@ def extract_amf_peer_records(
     return all_records
 
 
+
+def extract_peer_smf_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PEER-SMF vertical Target Values blocks.
+
+    Explicit source-to-CLI mapping:
+      peer-smf-id             -> SMFID
+      peer-smf-pfcp           -> PFCP
+      peer-smf-ip             -> IP
+      peer-smf-description    -> DESC
+      peer-smf-node-id        -> NODEID
+      peer-smf-delegate       -> DELEGATE
+      peer-smf-up-association -> UPASSO
+
+    Unmapped source fields such as peer-smf-assrel and peer-smf-epfar are ignored.
+    """
+    if section.command.upper() != "CRTE-PEER-SMF":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    aliases = {
+        "peer-smf-id": "SMFID",
+        "peer-smf-pfcp": "PFCP",
+        "peer-smf-ip": "IP",
+        "peer-smf-description": "DESC",
+        "peer-smf-node-id": "NODEID",
+        "peer-smf-delegate": "DELEGATE",
+        "peer-smf-up-association": "UPASSO",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    records: List[Dict[str, Any]] = []
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find the parameter-name column by counting known PEER-SMF params.
+        param_col = None
+        best_count = 0
+        for c in range(1, min(scan_column_limit(ws), 32) + 1):
+            count = 0
+            for r in range(marker_row + 1, end_row + 1):
+                if clean_param(ws.cell(r, c).value) in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        rec: Dict[str, Any] = {}
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            if param not in aliases:
+                continue
+
+            # First non-status, non-helper target value to the right before
+            # duplicated current-value parameter names begin.
+            raw_value = None
+            for c in range(param_col + 1, min(scan_column_limit(ws), 32) + 1):
+                candidate = ws.cell(r, c).value
+                if clean_param(candidate) in aliases:
+                    break
+                if CURRENT_RE.search(as_text(candidate)):
+                    break
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+                raw_value = candidate
+                break
+
+            if raw_value is None:
+                continue
+            if clean_cell_value(raw_value) is None:
+                continue
+
+            rec[param] = raw_value
+
+        if "peer-smf-id" in rec:
+            records.append(rec)
+
+    return records
+
+
 def extract_peer_service_records(
     wb_values,
     section: Section,
@@ -4752,6 +4872,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         amf_records = extract_amf_peer_records(wb_values, section, sections)
         if amf_records:
             return amf_records
+
+    if section.command.upper() == "CRTE-PEER-SMF":
+        peer_smf_records = extract_peer_smf_records(wb_values, section, sections)
+        if peer_smf_records:
+            return peer_smf_records
 
     if section.command.upper().startswith("CRTE-") and _service_fields_present(section):
         peer_records = extract_peer_service_records(wb_values, section, sections)
