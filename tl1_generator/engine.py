@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.144.0"
+SCRIPT_VERSION = "2.146.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1101,6 +1101,8 @@ def is_real_target_marker_row(ws_values, row: int, col: int) -> bool:
         "entries may be hidden",
         "entry may be hidden",
         "values may be hidden",
+        "values hidden",
+        "value hidden",
     }
 
     # Inspect only a small target-side window before Current Values.
@@ -3652,6 +3654,220 @@ def extract_onc_dict_records(
     return cleaned_recs
 
 
+
+
+def extract_aprsc_lmt_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract application resource limit rows.
+
+    Source table commonly contains:
+        limit-id | resource-type | critical-alarm | critical-clear |
+        major-alarm | major-clear | minor-alarm | minor-clear
+
+    CLI:
+        CRTE-APRSC-LMT:RSC,CRIA,CRIC,MAJA,MAJC,MINA,MINC,[DESC];
+
+    `resource-type` is descriptive/source context and is intentionally not
+    emitted because it has no CLI name in this command.
+    """
+    if section.command.upper() != "CRTE-APRSC-LMT":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # Protect explicit mappings even if the Parameters table contains blanks.
+    aliases = {
+        "limit-id": "RSC",
+        "critical-alarm": "CRIA",
+        "critical-clear": "CRIC",
+        "major-alarm": "MAJA",
+        "major-clear": "MAJC",
+        "minor-alarm": "MINA",
+        "minor-clear": "MINC",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find horizontal header row containing the relevant source parameters.
+        header_row = None
+        header_cols: Dict[str, int] = {}
+        expected_headers = {
+            "limit-id",
+            "resource-type",
+            "critical-alarm",
+            "critical-clear",
+            "major-alarm",
+            "major-clear",
+            "minor-alarm",
+            "minor-clear",
+        }
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[str, int] = {}
+            for c in range(1, scan_column_limit(ws) + 1):
+                p = clean_param(ws.cell(r, c).value).lower()
+                if p in expected_headers and p not in found:
+                    found[p] = c
+            if "limit-id" in found and "critical-alarm" in found and "minor-clear" in found:
+                header_row = r
+                header_cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            id_raw = ws.cell(r, header_cols["limit-id"]).value
+            if is_blank(id_raw):
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            id_clean = clean_cell_value(id_raw)
+            if id_clean in {None, ""} or is_status(id_raw):
+                continue
+            if not re.fullmatch(r"-?\d+", as_text(id_clean)):
+                continue
+
+            rec: Dict[str, Any] = {"limit-id": id_raw}
+            for param in (
+                "critical-alarm",
+                "critical-clear",
+                "major-alarm",
+                "major-clear",
+                "minor-alarm",
+                "minor-clear",
+            ):
+                col = header_cols.get(param)
+                if col is None:
+                    continue
+                raw = ws.cell(r, col).value
+                if raw is None:
+                    continue
+                if clean_cell_value(raw) is None:
+                    continue
+                rec[param] = raw
+
+            # Optional DESC can be present in some variants. If available,
+            # preserve it and let existing DESC case rules handle formatting.
+            desc_col = header_cols.get("desc")
+            if desc_col:
+                raw = ws.cell(r, desc_col).value
+                if raw is not None and clean_cell_value(raw) is not None:
+                    rec["DESC"] = raw
+                    section.param_to_cli["DESC"] = "DESC"
+
+            records.append(rec)
+
+    return records
+
+
+def extract_supp_lmt_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CHG-SUPP-LMT records from fault suppression target tables.
+
+    Expected source shape:
+        fault-code | inhibit | supp-limit
+
+    CLI mapping:
+        fault-code -> CODE
+        supp-limit -> LMT
+
+    The `inhibit` column is intentionally ignored because it is not part of
+    CHG-SUPP-LMT:[CODE],LMT.
+    """
+    if section.command.upper() != "CHG-SUPP-LMT":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    section.param_to_cli["fault-code"] = "CODE"
+    section.param_to_cli["supp-limit"] = "LMT"
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        header_row = None
+        code_col = None
+        lmt_col = None
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            row_code_col = None
+            row_lmt_col = None
+            for c in range(1, scan_column_limit(ws) + 1):
+                p = clean_param(ws.cell(r, c).value).lower()
+                if p == "fault-code":
+                    row_code_col = c
+                elif p == "supp-limit":
+                    row_lmt_col = c
+
+            if row_code_col is not None and row_lmt_col is not None:
+                header_row = r
+                code_col = row_code_col
+                lmt_col = row_lmt_col
+                break
+
+        if header_row is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            code_raw = ws.cell(r, code_col).value
+            lmt_raw = ws.cell(r, lmt_col).value
+
+            if is_blank(code_raw) and is_blank(lmt_raw):
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            code_clean = clean_cell_value(code_raw)
+            lmt_clean = clean_cell_value(lmt_raw)
+
+            if code_clean in {None, ""} or lmt_clean in {None, ""}:
+                continue
+            if is_reference_helper_value(code_raw) or is_reference_helper_value(lmt_raw):
+                continue
+
+            records.append({
+                "fault-code": code_raw,
+                "supp-limit": lmt_raw,
+            })
+
+    return records
+
+
 def extract_cha_rule_records(
     wb_values,
     section: Section,
@@ -3755,6 +3971,16 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CRTE-APRSC-LMT":
+        aprsc_records = extract_aprsc_lmt_records(wb_values, section, sections)
+        if aprsc_records:
+            return aprsc_records
+
+    if section.command.upper() == "CHG-SUPP-LMT":
+        supp_lmt_records = extract_supp_lmt_records(wb_values, section, sections)
+        if supp_lmt_records:
+            return supp_lmt_records
 
     if section.command.upper() == "CRTE-CHA-RULE":
         cha_rule_records = extract_cha_rule_records(wb_values, section, sections)
@@ -4995,7 +5221,10 @@ def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     If every assigned non-key value is a CIQ [default = ...] wrapper, skip the
     configuration entirely. Explicit key values may still be present.
     """
-    if record_has_only_default_non_key_values(section, record):
+    if (
+        section.command.upper() != "CHG-SUPP-LMT"
+        and record_has_only_default_non_key_values(section, record)
+    ):
         return None
 
     cli_values = record_to_cli_values(section, record, keep_arrows=False)
@@ -5076,14 +5305,22 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         # Generic default-only filtering must also apply to special renderers
         # (NE-GRP, peer service entries, MMERTAL, ACT-LIC, etc.) that do not
         # route through record_to_tl1().
-        default_only_count = sum(
-            1 for rec in extracted_records
-            if record_has_only_default_non_key_values(section, rec)
-        )
-        records = [
-            rec for rec in extracted_records
-            if not record_has_only_default_non_key_values(section, rec)
-        ]
+        # Generic default-only filtering normally removes records whose only
+        # non-key values are [default = ...]. CHG-SUPP-LMT is an exception:
+        # the per-fault default suppression limit (for example LMT=10) is the
+        # explicit value that must be applied for each CODE.
+        if section.command.upper() == "CHG-SUPP-LMT":
+            default_only_count = 0
+            records = list(extracted_records)
+        else:
+            default_only_count = sum(
+                1 for rec in extracted_records
+                if record_has_only_default_non_key_values(section, rec)
+            )
+            records = [
+                rec for rec in extracted_records
+                if not record_has_only_default_non_key_values(section, rec)
+            ]
 
         if len(records) >= 50000:
             print(f"  Rendering {len(records):,} TL1 candidate records for section #{idx}: {section.title}")
