@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.147.0"
+SCRIPT_VERSION = "2.148.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -5240,10 +5240,14 @@ def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
         if svc.strip().strip('"').lower() == "{all services}":
             return None
 
-    # Skip VES control entries when EVENT is the synthetic ALL selector.
+    # Skip VES control entries when EVENT selects all events.
+    # Accept both source variants:
+    #   EVENT=ALL
+    #   EVENT={ALL}
     if command_upper == "CHG-VES-CNTL":
         event = cli_values.get("EVENT", "")
-        if event.strip().strip('"').upper() == "{ALL}":
+        normalized_event = event.strip().strip('"').strip("{}").strip().upper()
+        if normalized_event == "ALL":
             return None
 
     # MEAS-KDAY TL1 expects TYPE without the RAW- prefix.
