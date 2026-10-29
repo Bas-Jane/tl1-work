@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.139.0"
+SCRIPT_VERSION = "2.140.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -487,7 +487,10 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     # Keep prior important case-sensitive fields stable when this simplified
     # script is used directly.
-    preserve_case = {"NFID", "FQDN", "SVCID", "INSTID", "PGWFQDN", "DFTDNN", "APN"}
+    preserve_case = {
+        "NFID", "FQDN", "SVCID", "INSTID", "PGWFQDN", "DFTDNN", "APN",
+        "NAME", "DESC",
+    }
     lower_case = {"SVC", "HOST", "REALM"}
     if cli in preserve_case:
         return quote_if_needed(value)
