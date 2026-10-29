@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.141.0"
+SCRIPT_VERSION = "2.144.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -351,12 +351,64 @@ def looks_like_formula_text(value: Any) -> bool:
     return isinstance(value, str) and value.startswith("=")
 
 
+
+def extract_default_value(text: str) -> Optional[str]:
+    """Extract the effective value from a [default = ...] wrapper.
+
+    Supported examples:
+      [default = off]        -> off
+      [default = {1}]        -> {1}
+      [default = XXX [yy]]   -> XXX
+      [default = abc [note]] -> abc
+
+    Any trailing nested bracket annotation inside the wrapper is removed.
+    """
+    raw = as_text(text).strip()
+    if not raw.lower().startswith("[default"):
+        return None
+
+    # Capture everything after '=' and before the final outer ']'.
+    m = re.match(r"^\[\s*default\s*=\s*(.*)\]\s*$", raw, flags=re.I | re.S)
+    if not m:
+        return None
+
+    inner = m.group(1).strip()
+
+    # Remove trailing annotation bracket(s), e.g. "XXX [yy]" -> "XXX".
+    # Preserve brace lists such as {1,2}.
+    inner = re.sub(r"(?:\s+\[[^\[\]]*\])+\s*$", "", inner).strip()
+
+    return inner
+
+
+
+def is_reference_helper_value(value: Any) -> bool:
+    """Return True for CIQ helper text that must never become TL1 data.
+
+    Examples:
+      Refer to column B below.
+      Refer to column C/D below.
+      See value below.
+      See values below.
+    """
+    s = norm_key(value)
+    if not s:
+        return False
+    return (
+        s.startswith("refer to column ")
+        or s in {"see value below.", "see value below", "see values below.", "see values below"}
+    )
+
+
 def clean_cell_value(value: Any) -> Optional[str]:
     """Return the base TL1 value text, or None when the value should be skipped/omitted."""
     if value is None:
         return ""   # keep blank as CLI_NAME=
 
     if is_status(value):
+        return None
+
+    if is_reference_helper_value(value):
         return None
 
     if isinstance(value, float) and value.is_integer():
@@ -367,10 +419,12 @@ def clean_cell_value(value: Any) -> Optional[str]:
     if not text:
         return ""
 
-    # Convert [default = none] -> none, [default = {1}] -> {1} first.
-    m = re.search(r"\[\s*default\s*=\s*([^\]]+)\]", text, re.I)
-    if m:
-        text = m.group(1).strip()
+    # Convert [default = ...] wrappers, including nested annotations such as:
+    #   [default = XXX [yy]] -> XXX
+    #   [default = {1}]      -> {1}
+    default_value = extract_default_value(text)
+    if default_value is not None:
+        text = default_value
 
     if is_skip_value(text):
         return None
@@ -3558,6 +3612,46 @@ def extract_pcf_pf_records(
 
 
 
+
+def extract_onc_dict_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract ONC-DICT from its Parameters table target values.
+
+    ONC-DICT commonly stores desired values directly in the Parameters table.
+    The remarks/target helper cells may contain text such as "Refer to column B
+    below.", which must never be rendered as ATTR/INIT/UPDATE/TERM values.
+    """
+    if section.command.upper() != "CHG-ONC-DICT":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    recs = parse_embedded_parameter_target_values(ws, section, next_cli_row)
+    cleaned_recs: List[Dict[str, Any]] = []
+
+    for rec in recs:
+        out: Dict[str, Any] = {}
+        for p, v in rec.items():
+            if str(p).startswith("__"):
+                out[p] = v
+                continue
+            if is_reference_helper_value(v):
+                continue
+            out[p] = v
+        if out:
+            cleaned_recs.append(out)
+
+    return cleaned_recs
+
+
 def extract_cha_rule_records(
     wb_values,
     section: Section,
@@ -3666,6 +3760,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         cha_rule_records = extract_cha_rule_records(wb_values, section, sections)
         if cha_rule_records:
             return cha_rule_records
+
+    if section.command.upper() == "CHG-ONC-DICT":
+        onc_dict_records = extract_onc_dict_records(wb_values, section, sections)
+        if onc_dict_records:
+            return onc_dict_records
 
     if section.command.upper() == "CRTE-PCF-PF":
         pcf_records = extract_pcf_pf_records(wb_values, section, sections)
@@ -3936,6 +4035,99 @@ def render_cli_line(
 
 
 
+
+
+
+
+def records_to_ofc_evt_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render only explicitly enabled/configured OFC event rows.
+
+    Default-off rows are omitted. Fixed ITEM/EVT values from the CLI Name cell
+    are retained. CAT is omitted when its source is [ENC]/unavailable.
+    """
+    if section.command.upper() != "CHG-OFC-EVT":
+        return []
+
+    lines: List[str] = []
+    order = ["ITEM", "EVT", "ENABLE", "CAT"]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals:
+            continue
+
+        enable = vals.get("ENABLE")
+        if not enable:
+            continue
+
+        # Skip rows whose target is only the default OFF setting.
+        raw_non_control = [
+            v for k, v in rec.items()
+            if not str(k).startswith("__")
+        ]
+        if raw_non_control and all(
+            is_default_wrapped_value(v) or clean_cell_value(v) is None
+            for v in raw_non_control
+        ):
+            continue
+
+        # The intended event outputs are enabled events only.
+        if enable.upper() != "ON":
+            continue
+
+        line = render_cli_line(
+            "CHG-OFC-EVT",
+            order,
+            vals,
+            required_order=order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
+
+
+def records_to_onc_rcode_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render ONC result-code child entries with mandatory MODE=ADD.
+
+    The source CLI template is:
+        CHG-ONC-RCODE:ID,MODE,TYPE,[START],[END],[RACT];
+
+    Target tables do not normally contain a MODE column, so MODE=ADD must be
+    supplied by the generator for every result-code child entry.
+    """
+    if section.command.upper() != "CHG-ONC-RCODE":
+        return []
+
+    lines: List[str] = []
+    order = ["ID", "MODE", "TYPE", "START", "END", "RACT"]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals:
+            continue
+        if "ID" not in vals or "TYPE" not in vals:
+            continue
+
+        out_vals: Dict[str, str] = {
+            "ID": vals["ID"],
+            "MODE": "ADD",
+            "TYPE": vals["TYPE"],
+        }
+        for key in ("START", "END", "RACT"):
+            if key in vals:
+                out_vals[key] = vals[key]
+
+        line = render_cli_line(
+            "CHG-ONC-RCODE",
+            order,
+            out_vals,
+            required_order=order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
 
 
 def records_to_rbase_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -4898,6 +5090,10 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
 
         if section.command.upper() == "ACT-LIC":
             lines = records_to_act_lic_tl1(section, records)
+        elif section.command.upper() == "CHG-OFC-EVT":
+            lines = records_to_ofc_evt_tl1(section, records)
+        elif section.command.upper() == "CHG-ONC-RCODE":
+            lines = records_to_onc_rcode_tl1(section, records)
         elif section.command.upper() == "CRTE-RBASE":
             lines = records_to_rbase_tl1(section, records)
         elif section.command.upper() == "CRTE-PDU-CONF":
