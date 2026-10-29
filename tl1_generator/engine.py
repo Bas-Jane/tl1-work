@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.171.0"
+SCRIPT_VERSION = "2.174.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -434,6 +434,10 @@ def is_reference_helper_value(value: Any) -> bool:
         return False
     return (
         s.startswith("refer to column ")
+        or (
+            s.startswith("refer to ")
+            and (" sheet" in s or s.endswith("sheet."))
+        )
         or s in {"see value below.", "see value below", "see values below.", "see values below"}
     )
 
@@ -2375,6 +2379,245 @@ def extract_epc_snssai_records(
 
 
 
+
+
+def extract_pdr_inf_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PDR-INF rows from the referenced Pre-Defined Rules sheet.
+
+    The referenced sheet already uses the YANG parameter names as headers.
+    Only target-side columns are consumed; duplicated Current Values columns
+    are ignored.
+    """
+    if section.command.upper() != "CRTE-PDR":
+        return []
+
+    aliases = {
+        "pdr-info-id": "ID",
+        "pdr-info-prec": "PREC",
+        "pdr-info-name": "NAME",
+        "pdr-info-pdi": "PDI",
+        "pdr-info-far": "FAR",
+        "pdr-info-urr-list": "URR",
+        "pdr-info-qer-list": "QER",
+        "pdr-info-disp": "DISP",
+        "pdr-info-desc": "DESC",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    referred_sheet_name = resolve_referred_sheet(wb_values, referred) if referred else None
+    if not referred_sheet_name:
+        return []
+
+    ref_ws = wb_values[referred_sheet_name]
+    markers = find_target_markers(ref_ws)
+    if not markers:
+        return []
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ref_ws, marker_row, None)
+        start_col, end_col = target_column_bounds(ref_ws, marker_row, marker_col)
+
+        header_row = None
+        param_cols: Dict[int, str] = {}
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[int, str] = {}
+            for c in range(start_col, end_col + 1):
+                p = clean_param(ref_ws.cell(r, c).value)
+                if p in aliases and p not in found.values():
+                    found[c] = p
+            if "pdr-info-id" in found.values() and \
+               "pdr-info-prec" in found.values() and \
+               "pdr-info-name" in found.values():
+                header_row = r
+                param_cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            rec: Dict[str, Any] = {}
+            has_any = False
+
+            for c, param in param_cols.items():
+                raw = ref_ws.cell(r, c).value
+                if not is_blank(raw):
+                    has_any = True
+                if is_struck_value(raw):
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+
+            if not has_any:
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            key_raw = rec.get("pdr-info-id")
+            if key_raw is None or clean_cell_value(key_raw) in {None, ""}:
+                continue
+
+            records.append(rec)
+
+    return records
+
+
+def extract_pdi_fltr_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PDI-FLTR rows from the referenced Packet Detection Filters sheet.
+
+    The referenced data sheet uses simplified headers rather than the YANG
+    parameter names used in the section definition. Map those headers directly
+    to the section parameters/CLI names.
+
+    Simplified source headers:
+      filter-id, direction, protocol, source-ip, source-port-start,
+      source-port-end, destination-ip, destination-port-start,
+      destination-port-end, dpi-protocol-id, url-filter-id,
+      dns-host-name-filter-id, service-name-filter-id, dscp, description
+    """
+    if section.command.upper() != "CRTE-PDI-FLTR":
+        return []
+
+    # Explicit YANG-parameter -> CLI aliases.
+    param_cli = {
+        "packet-detection-info-filter-id": "FLTRID",
+        "pdi-filter-direction": "DIR",
+        "pdi-filter-protocol": "PROT",
+        "pdi-filter-source-ip": "SIP",
+        "pdi-filter-source-port-start": "SPS",
+        "pdi-filter-source-port-end": "SPE",
+        "pdi-filter-destination-ip": "DIP",
+        "pdi-filter-destination-port-start": "DPS",
+        "pdi-filter-destination-port-end": "DPE",
+        "pdi-filter-dpi-protocol-id": "DPI",
+        "pdi-filter-url-filter-id": "URLID",
+        "pdi-filter-dns-host-name-filter-id": "DHOSTID",
+        "pdi-filter-service-name-filter-id": "SNIID",
+        "pdi-filter-dscp": "DSCP",
+        "pdi-filter-description": "DESC",
+    }
+    for p, cli in param_cli.items():
+        section.param_to_cli[p] = cli
+
+    header_to_param = {
+        "filter-id": "packet-detection-info-filter-id",
+        "direction": "pdi-filter-direction",
+        "protocol": "pdi-filter-protocol",
+        "source-ip": "pdi-filter-source-ip",
+        "source-port-start": "pdi-filter-source-port-start",
+        "source-port-end": "pdi-filter-source-port-end",
+        "destination-ip": "pdi-filter-destination-ip",
+        "destination-port-start": "pdi-filter-destination-port-start",
+        "destination-port-end": "pdi-filter-destination-port-end",
+        "dpi-protocol-id": "pdi-filter-dpi-protocol-id",
+        "url-filter-id": "pdi-filter-url-filter-id",
+        "dns-host-name-filter-id": "pdi-filter-dns-host-name-filter-id",
+        "service-name-filter-id": "pdi-filter-service-name-filter-id",
+        "dscp": "pdi-filter-dscp",
+        "description": "pdi-filter-description",
+    }
+
+    # Resolve the referred data sheet from this section.
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    referred_sheet_name = resolve_referred_sheet(wb_values, referred) if referred else None
+
+    # If the reference could not be resolved, do not fall back to parsing the
+    # textual "Refer to ... sheet" cells as data.
+    if not referred_sheet_name:
+        return []
+
+    ref_ws = wb_values[referred_sheet_name]
+    markers = find_target_markers(ref_ws)
+    if not markers:
+        return []
+
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ref_ws, marker_row, None)
+        start_col, end_col = target_column_bounds(ref_ws, marker_row, marker_col)
+
+        header_row = None
+        param_cols: Dict[int, str] = {}
+
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            found: Dict[int, str] = {}
+            for c in range(start_col, end_col + 1):
+                h = norm_key(ref_ws.cell(r, c).value)
+                if h in header_to_param:
+                    found[c] = header_to_param[h]
+            if "packet-detection-info-filter-id" in found.values() and \
+               "pdi-filter-direction" in found.values():
+                header_row = r
+                param_cols = found
+                break
+
+        if header_row is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            rec: Dict[str, Any] = {}
+            has_any = False
+
+            for c, param in param_cols.items():
+                raw = ref_ws.cell(r, c).value
+                if not is_blank(raw):
+                    has_any = True
+                if is_struck_value(raw):
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+
+            if not has_any:
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            key_raw = rec.get("packet-detection-info-filter-id")
+            if key_raw is None or clean_cell_value(key_raw) in {None, ""}:
+                continue
+
+            records.append(rec)
+
+    return records
+
+
 def extract_pdi_records(
     wb_values,
     section: Section,
@@ -2389,8 +2632,14 @@ def extract_pdi_records(
       packet-detection-info-appid            -> APPID
       packet-detection-info-fltr-list        -> FLTRID child list
 
-    The source filter list may contain one or many values in braces.
     Comparison markers such as 🗙 never suppress valid target values.
+
+    Some CIQ rows are damaged/shifted left when an empty source-interface cell
+    is omitted. Example:
+      210 | sktel_tethering | [ENC] | {12210} | 🗙
+    This is repaired as:
+      DESC=sktel_tethering, APPID=[ENC], FLTRID={12210}
+    rather than incorrectly treating {12210} as APPID.
     """
     if section.command.upper() != "CRTE-PDI":
         return []
@@ -2411,7 +2660,6 @@ def extract_pdi_records(
     for p, cli in aliases.items():
         section.param_to_cli[p] = cli
 
-    # Ensure source-interface is never inferred into the CLI.
     section.param_to_cli.pop("packet-detection-info-source-interface", None)
 
     param_table_end = find_parameter_table_end(ws, section, next_cli_row)
@@ -2427,9 +2675,6 @@ def extract_pdi_records(
 
         header_row = None
         cols: Dict[str, int] = {}
-
-        # The target table includes source-interface even though it has no TL1
-        # CLI name. Find all five source columns by source parameter name.
         expected_headers = {
             "packet-detection-info-id",
             "packet-detection-info-source-interface",
@@ -2462,19 +2707,51 @@ def extract_pdi_records(
             if cleaned_id in {None, ""}:
                 continue
 
+            src_raw = ws.cell(r, cols.get("packet-detection-info-source-interface")).value if cols.get("packet-detection-info-source-interface") else None
+            desc_raw = ws.cell(r, cols.get("packet-detection-info-description")).value if cols.get("packet-detection-info-description") else None
+            appid_raw = ws.cell(r, cols.get("packet-detection-info-appid")).value if cols.get("packet-detection-info-appid") else None
+            fltr_raw = ws.cell(r, cols.get("packet-detection-info-fltr-list")).value if cols.get("packet-detection-info-fltr-list") else None
+
+            # Repair a one-column-left shift caused by an omitted blank
+            # source-interface cell. Strong signature:
+            #   source-interface contains ordinary text,
+            #   description is [ENC],
+            #   appid contains a brace/list value,
+            #   filter column is blank/status.
+            src_text = as_text(src_raw).strip()
+            desc_text = as_text(desc_raw).strip()
+            appid_text = as_text(appid_raw).strip()
+            fltr_text = as_text(fltr_raw).strip()
+
+            shifted_left = (
+                src_text != ""
+                and not src_text.lower().startswith("[default")
+                and not is_status(src_raw)
+                and desc_text.lower() == "[enc]"
+                and (
+                    (appid_text.startswith("{") and appid_text.endswith("}"))
+                    or bool(re.fullmatch(r"\d+(?:\s*[,/&]\s*\d+)*", appid_text))
+                )
+                and (fltr_text == "" or is_status(fltr_raw))
+            )
+
+            if shifted_left:
+                shifted_filter_raw = appid_raw
+                desc_raw = src_raw
+                appid_raw = "[ENC]"
+                fltr_raw = shifted_filter_raw
+
             rec: Dict[str, Any] = {
                 "packet-detection-info-id": id_raw,
             }
 
-            for param in (
-                "packet-detection-info-description",
-                "packet-detection-info-appid",
-                "packet-detection-info-fltr-list",
-            ):
-                col = cols.get(param)
-                if not col:
-                    continue
-                raw = ws.cell(r, col).value
+            field_values = {
+                "packet-detection-info-description": desc_raw,
+                "packet-detection-info-appid": appid_raw,
+                "packet-detection-info-fltr-list": fltr_raw,
+            }
+
+            for param, raw in field_values.items():
                 if is_blank(raw) or is_status(raw) or is_struck_value(raw):
                     continue
                 cleaned = clean_cell_value(raw)
@@ -2485,6 +2762,7 @@ def extract_pdi_records(
             records.append(rec)
 
     return records
+
 
 
 def extract_pdr_set_records(
@@ -4853,6 +5131,21 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         if epc_records:
             return epc_records
 
+    if section.command.upper() == "CRTE-PDR":
+        pdr_inf_records = extract_pdr_inf_records(wb_values, section, sections)
+        if pdr_inf_records:
+            return pdr_inf_records
+        # Pointer-driven section: never turn the reference-helper text into data.
+        return []
+
+    if section.command.upper() == "CRTE-PDI-FLTR":
+        pdi_fltr_records = extract_pdi_fltr_records(wb_values, section, sections)
+        if pdi_fltr_records:
+            return pdi_fltr_records
+        # This section is pointer-driven. Never fall through to generic
+        # embedded parsing, which can turn "Refer to ... sheet" into values.
+        return []
+
     if section.command.upper() == "CRTE-PDI":
         pdi_records = extract_pdi_records(wb_values, section, sections)
         if pdi_records:
@@ -5222,6 +5515,69 @@ def records_to_onc_rcode_tl1(section: Section, records: List[Dict[str, Any]]) ->
     return lines
 
 
+
+
+
+def records_to_pdr_inf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render PDR-INF parent and optional change-only fields.
+
+    Create template:
+      CRTE-PDR:ID,PREC,NAME,[PDI],[DISP],[DESC];
+
+    Change-only fields from the supplied template:
+      CHG-PDR-INF:ID,TYPE,[FAR],[URR],[QER];
+
+    TYPE=ADD is supplied for the change command.
+    """
+    if section.command.upper() != "CRTE-PDR":
+        return []
+
+    lines: List[str] = []
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or not all(k in vals for k in ("ID", "PREC", "NAME")):
+            continue
+
+        create_vals: Dict[str, str] = {
+            "ID": vals["ID"],
+            "PREC": vals["PREC"],
+            "NAME": vals["NAME"],
+        }
+        for key in ("PDI", "DISP", "DESC"):
+            if key in vals:
+                create_vals[key] = vals[key]
+
+        create_line = render_cli_line(
+            "CRTE-PDR",
+            ["ID", "PREC", "NAME", "PDI", "DISP", "DESC"],
+            create_vals,
+            required_order=["ID", "PREC", "NAME", "PDI", "DISP", "DESC"],
+        )
+        if create_line:
+            lines.append(create_line)
+
+        extra_keys = [k for k in ("FAR", "URR", "QER") if k in vals]
+        if not extra_keys:
+            continue
+
+        chg_vals: Dict[str, str] = {
+            "ID": vals["ID"],
+            "TYPE": "ADD",
+        }
+        for key in extra_keys:
+            chg_vals[key] = vals[key]
+
+        chg_line = render_cli_line(
+            "CHG-PDR-INF",
+            ["ID", "TYPE", "FAR", "URR", "QER"],
+            chg_vals,
+            required_order=["ID", "TYPE", "FAR", "URR", "QER"],
+        )
+        if chg_line:
+            lines.append(chg_line)
+
+    return lines
 
 
 def records_to_pdi_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -6345,6 +6701,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
             lines = records_to_ofc_evt_tl1(section, records)
         elif section.command.upper() == "CHG-ONC-RCODE":
             lines = records_to_onc_rcode_tl1(section, records)
+        elif section.command.upper() == "CRTE-PDR":
+            lines = records_to_pdr_inf_tl1(section, records)
         elif section.command.upper() == "CRTE-PDI":
             lines = records_to_pdi_tl1(section, records)
         elif section.command.upper() == "CRTE-PDR-SET":
