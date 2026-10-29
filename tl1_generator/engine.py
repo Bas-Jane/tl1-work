@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.149.0"
+SCRIPT_VERSION = "2.156.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -43,8 +43,8 @@ DEFAULT_TARGET_MARKER_SCAN_MAX_ROWS = 2000
 MAX_BLANK_ROWS_IN_TARGET_TABLE = 25
 
 SKIP_VALUES = {
-    "[tbd]", "[st-input]", "[telus-input]", "[enc]", "tbd", "skip", "n/a"
-}
+    "[tbd]", "[st-input]", "[telus-input]", "[enc]", "tbd", "skip", "n/a",
+    "[ignore-keys]", "ignore-keys"}
 STATUS_VALUES = {"✓", "◌", "🗙", "↞", "⯑"}
 TARGET_RE = re.compile(r"\btarget\s+values?\b", re.I)
 CURRENT_RE = re.compile(r"\bcurrent\s+values?\b", re.I)
@@ -353,22 +353,27 @@ def looks_like_formula_text(value: Any) -> bool:
 
 
 def extract_default_value(text: str) -> Optional[str]:
-    """Extract the effective value from a [default = ...] wrapper.
+    """Extract the effective value from default-style wrappers.
 
     Supported examples:
-      [default = off]        -> off
-      [default = {1}]        -> {1}
-      [default = XXX [yy]]   -> XXX
-      [default = abc [note]] -> abc
+      [default = off]          -> off
+      [default = {1}]          -> {1}
+      [default = XXX [yy]]     -> XXX
+      [default = abc [note]]   -> abc
+      [APP default = xx]       -> xx
 
     Any trailing nested bracket annotation inside the wrapper is removed.
     """
     raw = as_text(text).strip()
-    if not raw.lower().startswith("[default"):
-        return None
 
-    # Capture everything after '=' and before the final outer ']'.
-    m = re.match(r"^\[\s*default\s*=\s*(.*)\]\s*$", raw, flags=re.I | re.S)
+    # Support both:
+    #   [default = ...]
+    #   [APP default = ...]
+    m = re.match(
+        r"^\[\s*(?:APP\s+)?default\s*=\s*(.*)\]\s*$",
+        raw,
+        flags=re.I | re.S,
+    )
     if not m:
         return None
 
@@ -398,6 +403,19 @@ def is_reference_helper_value(value: Any) -> bool:
         s.startswith("refer to column ")
         or s in {"see value below.", "see value below", "see values below.", "see values below"}
     )
+
+
+
+def normalize_cndb_uri(value: Any) -> str:
+    """Normalize CNDB URI lists split over lines into one comma-separated string."""
+    s = as_text(value).replace("\r", "\n")
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    parts = []
+    for chunk in re.split(r"[\n,]+", s):
+        item = chunk.strip()
+        if item:
+            parts.append(item)
+    return ",".join(parts)
 
 
 def clean_cell_value(value: Any) -> Optional[str]:
@@ -479,6 +497,13 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
 
+    # CRTE-CNDB URI values are case-sensitive text and may contain multiple
+    # IP:port entries split across source lines. TL1 expects '&' between URIs.
+    if cmd == "CRTE-CNDB" and cli == "URI":
+        normalized_uri = normalize_cndb_uri(value)
+        return normalized_uri.replace(",", "&")
+
+
     # CHG-FD-LMT value normalization.
     # The service/container name "istio-proxy" is case-sensitive and must remain
     # lowercase instead of being converted to ISTIO-PROXY.
@@ -495,6 +520,24 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
             return "INH"
         if normalized == "status-allow":
             return "ALW"
+
+    # CHG-GR-BGP FLT_STS normalization.
+    # The CLI expects abbreviated status values for this command.
+    if cmd == "CHG-GR-BGP" and cli == "FLT_STS":
+        normalized = value.strip().strip('"').upper()
+        if normalized == "ALLOW":
+            return "ALW"
+        if normalized == "INHIBIT":
+            return "INH"
+
+    # PODTYPE normalization.
+    # Source values use descriptive names while TL1 expects short codes.
+    if cli == "PODTYPE":
+        normalized = value.strip().strip('"').upper()
+        if normalized == "PACKETPROCESSING":
+            return "PP"
+        if normalized == "NETWORK-SERVICE":
+            return "NETS"
 
     # RTALIDX can be entered as "1 | 2", "1|2", "1 / 2", "1, 2", etc.
     # TL1 expects ampersand-separated values, especially for CHG-MMECALL-PROF:
@@ -538,6 +581,18 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
         parts = [p.strip() for p in re.split(r"[,;|&]+", raw) if p.strip()]
         normalized = "&".join(p.upper() for p in parts)
         return quote_if_needed(normalized)
+
+    # Generic comma-separated parameter lists use '&' in TL1.
+    # Example:
+    #   PARAM=xxx,xxx,xxx -> PARAM=XXX&XXX&XXX
+    #
+    # Command-specific handlers above take precedence. DESC is excluded because
+    # commas can be normal punctuation in free-text descriptions.
+    if cli != "DESC" and "," in value:
+        parts = [part.strip() for part in value.split(",")]
+        parts = [part for part in parts if part]
+        if len(parts) > 1:
+            value = "&".join(parts)
 
     # Keep prior important case-sensitive fields stable when this simplified
     # script is used directly.
@@ -3656,6 +3711,74 @@ def extract_onc_dict_records(
 
 
 
+
+def extract_cndb_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract CRTE-CNDB:URI from the horizontal CNDB target table."""
+    if section.command.upper() != "CRTE-CNDB":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    # Only URI is emitted by the CLI. cndb-type is fixed/source context.
+    section.param_to_cli["cndb-uri"] = "URI"
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+        target_start_col, target_end_col = target_column_bounds(
+            ws, marker_row, marker_col
+        )
+
+        header_row = None
+        uri_col = None
+        for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
+            for c in range(target_start_col, target_end_col + 1):
+                p = clean_param(ws.cell(r, c).value).lower()
+                if p == "cndb-uri":
+                    header_row = r
+                    uri_col = c
+                    break
+            if uri_col is not None:
+                break
+
+        if header_row is None or uri_col is None:
+            continue
+
+        blank_run = 0
+        for r in range(header_row + 1, end_row + 1):
+            raw_uri = ws.cell(r, uri_col).value
+
+            if is_blank(raw_uri):
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+                continue
+            blank_run = 0
+
+            if is_status(raw_uri) or is_reference_helper_value(raw_uri):
+                continue
+
+            uri = normalize_cndb_uri(raw_uri)
+            if not uri:
+                continue
+
+            records.append({"cndb-uri": uri})
+
+    return records
+
+
 def extract_aprsc_lmt_records(
     wb_values,
     section: Section,
@@ -3975,6 +4098,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CRTE-CNDB":
+        cndb_records = extract_cndb_records(wb_values, section, sections)
+        if cndb_records:
+            return cndb_records
 
     if section.command.upper() == "CRTE-APRSC-LMT":
         aprsc_records = extract_aprsc_lmt_records(wb_values, section, sections)
