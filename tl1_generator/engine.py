@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.146.0"
+SCRIPT_VERSION = "2.147.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -3821,14 +3821,18 @@ def extract_supp_lmt_records(
         code_col = None
         lmt_col = None
 
+        target_start_col, target_end_col = target_column_bounds(
+            ws, marker_row, marker_col
+        )
+
         for r in range(marker_row + 1, min(end_row, marker_row + 5) + 1):
             row_code_col = None
             row_lmt_col = None
-            for c in range(1, scan_column_limit(ws) + 1):
+            for c in range(target_start_col, target_end_col + 1):
                 p = clean_param(ws.cell(r, c).value).lower()
-                if p == "fault-code":
+                if p == "fault-code" and row_code_col is None:
                     row_code_col = c
-                elif p == "supp-limit":
+                elif p == "supp-limit" and row_lmt_col is None:
                     row_lmt_col = c
 
             if row_code_col is not None and row_lmt_col is not None:
@@ -5221,10 +5225,7 @@ def record_to_tl1(section: Section, record: Dict[str, Any]) -> Optional[str]:
     If every assigned non-key value is a CIQ [default = ...] wrapper, skip the
     configuration entirely. Explicit key values may still be present.
     """
-    if (
-        section.command.upper() != "CHG-SUPP-LMT"
-        and record_has_only_default_non_key_values(section, record)
-    ):
+    if record_has_only_default_non_key_values(section, record):
         return None
 
     cli_values = record_to_cli_values(section, record, keep_arrows=False)
@@ -5305,22 +5306,17 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
         # Generic default-only filtering must also apply to special renderers
         # (NE-GRP, peer service entries, MMERTAL, ACT-LIC, etc.) that do not
         # route through record_to_tl1().
-        # Generic default-only filtering normally removes records whose only
-        # non-key values are [default = ...]. CHG-SUPP-LMT is an exception:
-        # the per-fault default suppression limit (for example LMT=10) is the
-        # explicit value that must be applied for each CODE.
-        if section.command.upper() == "CHG-SUPP-LMT":
-            default_only_count = 0
-            records = list(extracted_records)
-        else:
-            default_only_count = sum(
-                1 for rec in extracted_records
-                if record_has_only_default_non_key_values(section, rec)
-            )
-            records = [
-                rec for rec in extracted_records
-                if not record_has_only_default_non_key_values(section, rec)
-            ]
+        # Generic default-only filtering applies to every section, including
+        # CHG-SUPP-LMT. A key plus only [default = ...] non-key values does not
+        # generate a TL1 command.
+        default_only_count = sum(
+            1 for rec in extracted_records
+            if record_has_only_default_non_key_values(section, rec)
+        )
+        records = [
+            rec for rec in extracted_records
+            if not record_has_only_default_non_key_values(section, rec)
+        ]
 
         if len(records) >= 50000:
             print(f"  Rendering {len(records):,} TL1 candidate records for section #{idx}: {section.title}")
