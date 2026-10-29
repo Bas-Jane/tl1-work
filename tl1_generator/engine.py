@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.137.0"
+SCRIPT_VERSION = "2.138.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1024,6 +1024,45 @@ def find_parameter_table_end(ws_values, section: Section, next_cli_row: int) -> 
 # -----------------------------
 # Target table discovery and parsing
 # -----------------------------
+
+def is_real_target_marker_row(ws_values, row: int, col: int) -> bool:
+    """Return True for a real Target Values block marker.
+
+    Some damaged CIQ rows can contain the literal text "Target Values (B1C3)"
+    inside what is actually a data row, for example:
+        Target Values (B1C3) | [ENC] | ... | Target Values (B1C3) | [ENC]
+
+    A real marker may contain harmless notes such as "Entries may be hidden",
+    but should not contain an actual target value immediately to the right.
+    """
+    marker_text = as_text(ws_values.cell(row, col).value)
+    if not TARGET_RE.search(marker_text):
+        return False
+
+    harmless = {
+        "",
+        "entries may be hidden",
+        "entry may be hidden",
+        "values may be hidden",
+    }
+
+    # Inspect only a small target-side window before Current Values.
+    for c in range(col + 1, min(scan_column_limit(ws_values), col + 4) + 1):
+        v = ws_values.cell(row, c).value
+        if is_blank(v) or is_status(v):
+            continue
+        s = norm_key(v)
+        if s in harmless:
+            continue
+        if CURRENT_RE.search(as_text(v)):
+            break
+
+        # Any other value means this is likely a damaged data row, not a marker.
+        return False
+
+    return True
+
+
 def find_target_markers(ws_values, start_row: int = 1, end_row: Optional[int] = None) -> List[Tuple[int, int]]:
     """Find Target Values markers without scanning huge data sheets end-to-end.
 
@@ -1062,7 +1101,9 @@ def find_target_markers(ws_values, start_row: int = 1, end_row: Optional[int] = 
             if cell.value is None:
                 continue
             text = as_text(cell.value)
-            if TARGET_RE.search(text):
+            if TARGET_RE.search(text) and is_real_target_marker_row(
+                ws_values, cell.row, cell.column
+            ):
                 markers.append((cell.row, cell.column))
     return markers
 
@@ -1119,7 +1160,28 @@ def _param_match(value: Any, known_params: set[str]) -> Optional[str]:
 
 
 def _region_end_row(ws_values, marker_row: int, next_section_row: Optional[int] = None) -> int:
-    limit = min(ws_values.max_row, (next_section_row - 1) if next_section_row else ws_values.max_row)
+    """Return the last row belonging to one Target Values block.
+
+    A CIQ section may contain many Target Values blocks. Older versions let
+    special sequential parsers run until the next CLI section, which caused
+    later objects to overwrite/duplicate earlier objects.
+    """
+    limit = min(
+        ws_values.max_row,
+        (next_section_row - 1) if next_section_row else ws_values.max_row,
+    )
+
+    for r in range(marker_row + 1, limit + 1):
+        # A new CLI section always ends this region.
+        for c in range(1, min(scan_column_limit(ws_values), 16) + 1):
+            if CLI_RE.search(as_text(ws_values.cell(r, c).value)):
+                return r - 1
+
+        # Stop only on a *real* Target Values marker, not on damaged data rows.
+        for c in range(1, min(scan_column_limit(ws_values), 16) + 1):
+            if is_real_target_marker_row(ws_values, r, c):
+                return r - 1
+
     return limit
 
 
@@ -1338,6 +1400,7 @@ def parse_horizontal_targets(
 
     records: List[Dict[str, Any]] = []
     blank_run = 0
+    inherited_values: Dict[str, Any] = {}
     watch_cols = sorted(set(list(param_cols.keys()) + list(range(1, min(ws_values.max_column, 8) + 1))))
 
     for r in range(header_row + 1, end_row + 1):
@@ -1364,6 +1427,13 @@ def parse_horizontal_targets(
             value = ws_values.cell(r, c).value
             if value is not None and as_text(value) != "":
                 has_any_value = True
+            # Horizontal continuation arrows inherit the previous value for
+            # that parameter. This is used by PCF-ERR and similar tables.
+            if is_arrow_value(value):
+                value = inherited_values.get(p, value)
+            elif value is not None and as_text(value) != "":
+                inherited_values[p] = value
+
             rec[p] = value
 
         # Capture an optional row-level action marker from an unmapped control
@@ -3050,12 +3120,106 @@ def extract_gtpc_cause_records(
 
 
 
+
+def parameter_table_entries(
+    ws_values,
+    section: Section,
+    next_cli_row: int,
+) -> List[Tuple[str, str, str]]:
+    """Return (parameter, type, cli-name) in Parameters-table order."""
+    max_row = min(ws_values.max_row, next_cli_row - 1)
+    header_row = None
+    param_col = None
+    type_col = None
+    cli_col = None
+
+    for r in range(section.cli_row, max_row + 1):
+        for c in range(1, scan_column_limit(ws_values) + 1):
+            key = norm_key(ws_values.cell(r, c).value)
+            if key in {"parameters", "paramaters"}:
+                header_row = r
+                param_col = c
+                break
+        if header_row is not None:
+            break
+
+    if header_row is None or param_col is None:
+        return []
+
+    for c in range(1, scan_column_limit(ws_values) + 1):
+        key = norm_key(ws_values.cell(header_row, c).value)
+        if key == "type":
+            type_col = c
+        elif key == "cli name":
+            cli_col = c
+
+    entries: List[Tuple[str, str, str]] = []
+    for r in range(header_row + 1, max_row + 1):
+        row_text = " | ".join(
+            as_text(ws_values.cell(r, c).value)
+            for c in range(1, scan_column_limit(ws_values) + 1)
+        )
+        if TARGET_RE.search(row_text) or CLI_RE.search(row_text):
+            break
+
+        p = clean_param(ws_values.cell(r, param_col).value)
+        if not p or is_placeholder_param(p):
+            continue
+
+        typ = as_text(ws_values.cell(r, type_col).value) if type_col else ""
+        cli = clean_cli_name(ws_values.cell(r, cli_col).value) if cli_col else ""
+        entries.append((p, typ, cli))
+
+    return entries
+
+
+def target_value_from_vertical_row(
+    ws_values,
+    row: int,
+    param_col: int,
+    known_params: set[str],
+) -> Any:
+    """Read the desired target value before the duplicated Current Values area."""
+    raw_value = None
+    for c in range(param_col + 1, scan_column_limit(ws_values) + 1):
+        candidate = ws_values.cell(row, c).value
+        if is_blank(candidate) or is_status(candidate):
+            continue
+        if clean_param(candidate) in known_params:
+            break
+        if CURRENT_RE.search(as_text(candidate)):
+            break
+        raw_value = candidate
+        break
+    return raw_value
+
+
+def leading_row_has_arrow(ws_values, row: int, param_col: int) -> bool:
+    """Detect ↪ / ⇢ group markers in cells to the left of the parameter."""
+    for c in range(1, max(1, param_col)):
+        if is_arrow_value(ws_values.cell(row, c).value):
+            return True
+        s = as_text(ws_values.cell(row, c).value)
+        if "↪" in s or "⇢" in s:
+            return True
+    return False
+
+
 def extract_pdu_conf_records(
     wb_values,
     section: Section,
     sections: List[Section],
 ) -> List[Dict[str, Any]]:
-    """Extract PDU-CONF parent plus repeated DSCP child tuples."""
+    """Extract PDU-CONF parent records and DSCP children robustly.
+
+    Recovery behavior:
+      * each real Target Values block is processed independently;
+      * parent rows are aligned to Parameters-table order;
+      * if one source parameter label is missing/shifted, following values stay
+        aligned positionally rather than shifting into the wrong CLI fields;
+      * DSCP child groups are reconstructed from ↪/⇢ row grouping, so even
+        damaged child parameter labels do not lose FQI/UL/DL values.
+    """
     if section.command.upper() != "CRTE-PDU-CONF":
         return []
 
@@ -3066,75 +3230,116 @@ def extract_pdu_conf_records(
         or [ws.max_row + 1]
     )
 
-    # Ensure DSCP child mappings are available even when CLI Name cells are blank.
     section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-fqi"] = "DSCPFQI"
     section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-ul"] = "DSCPUL"
     section.param_to_cli["pdu-conf-dscp/pdu-conf-dscp-dl"] = "DSCPDL"
 
-    known_params = set(section.param_to_cli.keys())
+    entries = parameter_table_entries(ws, section, next_cli_row)
+    parent_order = [
+        p for p, typ, _cli in entries
+        if "child list" not in norm_key(typ)
+        and not p.startswith("pdu-conf-dscp/")
+    ]
+    known_params = set(section.param_to_cli.keys()) | {p for p, _, _ in entries}
+
     param_table_end = find_parameter_table_end(ws, section, next_cli_row)
     markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
-    if not markers:
-        return []
-
     results: List[Dict[str, Any]] = []
 
     for marker_row, marker_col in markers:
         end_row = _region_end_row(ws, marker_row, next_cli_row)
 
-        # Find parameter column in the target-value block.
+        # Locate the parameter-name column.
         param_col = None
         best_count = 0
         for c in range(1, scan_column_limit(ws) + 1):
             count = 0
-            for r in range(marker_row + 1, min(end_row, marker_row + 220) + 1):
+            for r in range(marker_row + 1, min(end_row, marker_row + 180) + 1):
                 if clean_param(ws.cell(r, c).value) in known_params:
                     count += 1
             if count > best_count:
                 best_count = count
                 param_col = c
 
-        if param_col is None:
+        if param_col is None or best_count < 2:
+            continue
+
+        # Find first populated parent row, normally pdu-conf-id.
+        data_rows: List[int] = []
+        for r in range(marker_row + 1, end_row + 1):
+            raw = target_value_from_vertical_row(ws, r, param_col, known_params)
+            # Keep explicit placeholder rows such as [ENC] in the sequence so
+            # later values do not shift into earlier parameters. They advance
+            # positional alignment but are still omitted from TL1 output.
+            if raw is None:
+                continue
+            data_rows.append(r)
+
+        if not data_rows:
             continue
 
         parent: Dict[str, Any] = {}
         children: List[Dict[str, Any]] = []
+
+        parent_idx = 0
+        child_started = False
         current_child: Optional[Dict[str, Any]] = None
+        child_pos = 0
 
-        for r in range(marker_row + 1, end_row + 1):
-            param = clean_param(ws.cell(r, param_col).value)
-            if param not in known_params:
-                continue
-
-            raw_value = None
-            for c in range(param_col + 1, scan_column_limit(ws) + 1):
-                candidate = ws.cell(r, c).value
-                if is_blank(candidate) or is_status(candidate):
-                    continue
-                if clean_param(candidate) in known_params:
-                    break
-                if CURRENT_RE.search(as_text(candidate)):
-                    break
-                raw_value = candidate
-                break
-
+        for r in data_rows:
+            observed = clean_param(ws.cell(r, param_col).value)
+            raw_value = target_value_from_vertical_row(ws, r, param_col, known_params)
             if raw_value is None:
                 continue
-            if clean_cell_value(raw_value) is None:
+            cleaned_value = clean_cell_value(raw_value)
+
+            has_arrow = leading_row_has_arrow(ws, r, param_col)
+
+            # DSCP groups are explicitly delimited by arrow rows. Once child
+            # processing starts, map values by group position rather than by
+            # potentially damaged labels.
+            if has_arrow:
+                child_started = True
+                marker_text = " ".join(
+                    as_text(ws.cell(r, c).value)
+                    for c in range(1, max(2, param_col))
+                )
+                if "↪" in marker_text:
+                    if current_child:
+                        children.append(current_child)
+                    current_child = {}
+                    child_pos = 0
+
+                if current_child is None:
+                    current_child = {}
+
+                if cleaned_value is not None:
+                    if child_pos == 0:
+                        current_child["pdu-conf-dscp/pdu-conf-dscp-fqi"] = raw_value
+                    elif child_pos == 1:
+                        current_child["pdu-conf-dscp/pdu-conf-dscp-ul"] = raw_value
+                    elif child_pos == 2:
+                        current_child["pdu-conf-dscp/pdu-conf-dscp-dl"] = raw_value
+                child_pos += 1
                 continue
 
-            if param == "pdu-conf-dscp/pdu-conf-dscp-fqi":
-                if current_child:
-                    children.append(current_child)
-                current_child = {param: raw_value}
-            elif param in {
-                "pdu-conf-dscp/pdu-conf-dscp-ul",
-                "pdu-conf-dscp/pdu-conf-dscp-dl",
-            }:
-                if current_child is not None:
-                    current_child[param] = raw_value
-            else:
-                parent[param] = raw_value
+            if child_started:
+                continue
+
+            # Ignore a pre-child [ENC] child placeholder row.
+            if observed.startswith("pdu-conf-dscp/"):
+                continue
+
+            # Parent positional alignment. Normal blocks match exactly. If a
+            # label is missing (as in the supplied ID=2000 block), this keeps
+            # all subsequent values attached to the intended parameter order.
+            if parent_idx >= len(parent_order):
+                continue
+
+            expected_param = parent_order[parent_idx]
+            if cleaned_value is not None:
+                parent[expected_param] = raw_value
+            parent_idx += 1
 
         if current_child:
             children.append(current_child)
@@ -3142,23 +3347,27 @@ def extract_pdu_conf_records(
         if not parent:
             continue
 
+        # Require a usable ID; empty placeholder blocks are ignored.
+        id_param = next(
+            (p for p, cli in section.param_to_cli.items()
+             if cli.upper() == "ID" and p in parent),
+            None,
+        )
+        if not id_param or clean_cell_value(parent.get(id_param)) in {None, ""}:
+            continue
+
         results.append(parent)
 
-        # Find parent ID key for child CHG records.
-        parent_id_key = None
-        for p, cli in section.param_to_cli.items():
-            if cli.upper() == "ID" and p in parent:
-                parent_id_key = p
-                break
-
         for child in children:
-            rec: Dict[str, Any] = dict(child)
-            if parent_id_key:
-                rec[parent_id_key] = parent[parent_id_key]
-            rec["__ROW_ACTION__"] = "CHG"
+            rec: Dict[str, Any] = {
+                id_param: parent[id_param],
+                **child,
+                "__ROW_ACTION__": "CHG",
+            }
             results.append(rec)
 
     return results
+
 
 
 def section_has_unmapped_pdu_dscp_children(
@@ -3170,6 +3379,181 @@ def section_has_unmapped_pdu_dscp_children(
     return False
 
 
+
+def extract_pcf_pf_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract PCF-PF parent and repeated child lists with positional recovery."""
+    if section.command.upper() != "CRTE-PCF-PF":
+        return []
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    entries = parameter_table_entries(ws, section, next_cli_row)
+    parent_order = [p for p, typ, _ in entries if "child list" not in norm_key(typ)]
+    known_params = set(section.param_to_cli.keys()) | {p for p, _, _ in entries}
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    results: List[Dict[str, Any]] = []
+
+    fail_params = [
+        "pcf-pf-fail-actionlist/pcf-pf-fail-oper",
+        "pcf-pf-fail-actionlist/pcf-pf-fail-oos",
+        "pcf-pf-fail-actionlist/pcf-pf-fail-tout",
+    ]
+    event_params = [
+        "pcf-pf-event-reportlist/pcf-pf-evrpt",
+        "pcf-pf-event-reportlist/pcf-pf-evmode",
+    ]
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        param_col = None
+        best_count = 0
+        for c in range(1, scan_column_limit(ws) + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 80) + 1):
+                p = clean_param(ws.cell(r, c).value)
+                if p in known_params or (p == 0):
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None:
+            continue
+
+        rows: List[Tuple[int, Any, Any]] = []
+        for r in range(marker_row + 1, end_row + 1):
+            raw = target_value_from_vertical_row(ws, r, param_col, known_params)
+            if raw is None:
+                continue
+            rows.append((r, ws.cell(r, param_col).value, raw))
+
+        if not rows:
+            continue
+
+        parent: Dict[str, Any] = {}
+        fail_children: List[Dict[str, Any]] = []
+        event_children: List[Dict[str, Any]] = []
+
+        parent_idx = 0
+        current_child: Optional[Dict[str, Any]] = None
+        current_kind: Optional[str] = None
+        child_pos = 0
+
+        for r, observed_raw, raw_value in rows:
+            observed = clean_param(observed_raw)
+            lead_text = " ".join(
+                as_text(ws.cell(r, c).value)
+                for c in range(1, max(2, param_col))
+            )
+            has_arrow = "↪" in lead_text or "⇢" in lead_text or leading_row_has_arrow(ws, r, param_col)
+
+            # Child continuation rows do not always repeat an arrow marker.
+            # Once a child group has started, recognized child parameter rows
+            # remain in that group until a new ↪ group begins.
+            observed_is_fail_child = observed in fail_params
+            observed_is_event_child = observed in event_params
+            child_continuation = (
+                current_child is not None
+                and (
+                    (current_kind == "fail" and observed_is_fail_child)
+                    or (current_kind == "event" and observed_is_event_child)
+                )
+            )
+
+            if has_arrow or child_continuation:
+                if "↪" in lead_text:
+                    if current_child:
+                        if current_kind == "fail":
+                            fail_children.append(current_child)
+                        elif current_kind == "event":
+                            event_children.append(current_child)
+                    current_child = {}
+                    child_pos = 0
+                    current_kind = "event" if "(B)" in lead_text.upper() else "fail"
+
+                if current_child is None:
+                    current_child = {}
+
+                params = event_params if current_kind == "event" else fail_params
+
+                # Prefer actual child parameter identity when available. Fall
+                # back to group position for damaged labels.
+                if current_kind == "fail" and observed_is_fail_child:
+                    target_param = observed
+                elif current_kind == "event" and observed_is_event_child:
+                    target_param = observed
+                else:
+                    target_param = params[child_pos] if child_pos < len(params) else None
+
+                if target_param and clean_cell_value(raw_value) is not None:
+                    current_child[target_param] = raw_value
+
+                if target_param in params:
+                    child_pos = max(child_pos + 1, params.index(target_param) + 1)
+                else:
+                    child_pos += 1
+                continue
+
+            # Parent rows are aligned positionally. This repairs the supplied
+            # PFID=11 block where target-side parameter labels are shifted.
+            if parent_idx < len(parent_order):
+                if clean_cell_value(raw_value) is not None:
+                    parent[parent_order[parent_idx]] = raw_value
+                parent_idx += 1
+
+        if current_child:
+            if current_kind == "fail":
+                fail_children.append(current_child)
+            elif current_kind == "event":
+                event_children.append(current_child)
+
+        id_param = next(
+            (p for p, cli in section.param_to_cli.items()
+             if cli.upper() == "PFID" and p in parent),
+            None,
+        )
+        if not id_param or clean_cell_value(parent.get(id_param)) in {None, ""}:
+            continue
+
+        # Parent record carries first valid child from each list when possible.
+        parent_rec = dict(parent)
+        if fail_children:
+            parent_rec.update(fail_children[0])
+        if event_children:
+            parent_rec.update(event_children[0])
+        results.append(parent_rec)
+
+        # Additional child entries are preserved as explicit continuation rows.
+        for child in fail_children[1:]:
+            results.append({
+                id_param: parent[id_param],
+                **child,
+                "__ROW_ACTION__": "CHG",
+                "__PCF_CHILD_KIND__": "fail",
+            })
+        for child in event_children[1:]:
+            results.append({
+                id_param: parent[id_param],
+                **child,
+                "__ROW_ACTION__": "CHG",
+                "__PCF_CHILD_KIND__": "event",
+            })
+
+    return results
+
+
 def extract_target_records_for_section(wb_values, section: Section, sections: List[Section]) -> List[Dict[str, Any]]:
     if section.command.upper() == "ACT-LIC":
         return extract_act_lic_record(wb_values, section, sections)
@@ -3178,6 +3562,11 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         pdu_records = extract_pdu_conf_records(wb_values, section, sections)
         if pdu_records:
             return pdu_records
+
+    if section.command.upper() == "CRTE-PCF-PF":
+        pcf_records = extract_pcf_pf_records(wb_values, section, sections)
+        if pcf_records:
+            return pcf_records
 
     if section.command.upper() == "CRTE-EPC-SNSSAI":
         epc_records = extract_epc_snssai_records(wb_values, section, sections)
@@ -3441,6 +3830,63 @@ def render_cli_line(
 
 
 
+
+
+
+def records_to_pcf_pf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render PCF-PF parent plus preserved child-list continuation rows."""
+    if section.command.upper() != "CRTE-PCF-PF":
+        return []
+
+    lines: List[str] = []
+    created: set[str] = set()
+
+    # Child-list continuation ordering. MODE is deliberately before child keys.
+    fail_order = ["PFID", "MODE", "PFOPR", "PFOOS", "PFTOUT"]
+    event_order = ["PFID", "MODE", "EVTRPT", "EVMODE"]
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals or "PFID" not in vals:
+            continue
+
+        pfid = vals["PFID"]
+        kind = rec.get("__PCF_CHILD_KIND__")
+
+        if kind:
+            chg_vals = {"PFID": pfid, "MODE": "ADD"}
+            if kind == "fail":
+                for k in ("PFOPR", "PFOOS", "PFTOUT"):
+                    if k in vals:
+                        chg_vals[k] = vals[k]
+                line = render_cli_line(
+                    "CHG-PCF-PF", fail_order, chg_vals, required_order=fail_order
+                )
+            else:
+                for k in ("EVTRPT", "EVMODE"):
+                    if k in vals:
+                        chg_vals[k] = vals[k]
+                line = render_cli_line(
+                    "CHG-PCF-PF", event_order, chg_vals, required_order=event_order
+                )
+            if line:
+                lines.append(line)
+            continue
+
+        if pfid in created:
+            continue
+
+        line = render_cli_line(
+            "CRTE-PCF-PF",
+            section.cli_order,
+            vals,
+            required_order=section.cli_order,
+        )
+        if line:
+            lines.append(line)
+            created.add(pfid)
+
+    return lines
 
 
 def records_to_pdu_conf_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
@@ -4286,6 +4732,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
             lines = records_to_act_lic_tl1(section, records)
         elif section.command.upper() == "CRTE-PDU-CONF":
             lines = records_to_pdu_conf_tl1(section, records)
+        elif section.command.upper() == "CRTE-PCF-PF":
+            lines = records_to_pcf_pf_tl1(section, records)
         elif section.command.upper() == "CRTE-EPC-SNSSAI":
             lines = records_to_epc_snssai_tl1(section, records)
         elif section.command.upper() == "CRTE-SNSSAI":
