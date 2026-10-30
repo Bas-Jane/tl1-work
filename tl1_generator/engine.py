@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.174.0"
+SCRIPT_VERSION = "2.176.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -576,6 +576,14 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
             return "INH"
         if normalized == "status-allow":
             return "ALW"
+
+    # URR reporting-trigger normalization.
+    if cmd == "CRTE-URR" and cli == "RPT":
+        normalized = value.strip()
+        m = re.match(r"^([A-Za-z0-9_-]+)\s*\([^)]*\)\s*$", normalized)
+        if m:
+            normalized = m.group(1)
+        return normalized.upper()
 
     # CHG-GR-BGP FLT_STS normalization.
     # The CLI expects abbreviated status values for this command.
@@ -2379,6 +2387,266 @@ def extract_epc_snssai_records(
 
 
 
+
+
+
+
+def extract_ddnsip_fltr_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract DDNSIP-FLTR vertical Target Values blocks into one record each.
+
+    Source fields:
+      ddn-prsv-fltr-id                 -> ID
+      prsv-fltr-protocol               -> PROT
+      prsv-fltr-source-ip4-address     -> IP (combined with subnet mask)
+      prsv-fltr-source-ip4-subnet-mask -> IP suffix
+      prsv-fltr-source-port-start      -> SPS
+      prsv-fltr-source-port-end        -> SPE
+      private-external-value           -> VAL
+      prsv-fltr-description            -> DESC
+
+    IPv6 fields are ignored for this CLI because the supplied template exposes
+    only one IP field.
+    """
+    if section.command.upper() != "CRTE-DDNSIP-FLTR":
+        return []
+
+    aliases = {
+        "ddn-prsv-fltr-id": "ID",
+        "prsv-fltr-protocol": "PROT",
+        "prsv-fltr-source-ip4-address": "IP4",
+        "prsv-fltr-source-ip4-subnet-mask": "MASK4",
+        "prsv-fltr-source-port-start": "SPS",
+        "prsv-fltr-source-port-end": "SPE",
+        "private-external-value": "VAL",
+        "prsv-fltr-description": "DESC",
+    }
+
+    # Actual CLI mappings used by record_to_cli_values.
+    section.param_to_cli["ddn-prsv-fltr-id"] = "ID"
+    section.param_to_cli["prsv-fltr-protocol"] = "PROT"
+    section.param_to_cli["prsv-fltr-source-port-start"] = "SPS"
+    section.param_to_cli["prsv-fltr-source-port-end"] = "SPE"
+    section.param_to_cli["private-external-value"] = "VAL"
+    section.param_to_cli["prsv-fltr-description"] = "DESC"
+    section.param_to_cli["__ddnsip_combined_ip__"] = "IP"
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        # Find dominant parameter-name column for the vertical target block.
+        param_col = None
+        best_count = 0
+        for c in range(1, min(scan_column_limit(ws), 24) + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 30) + 1):
+                if clean_param(ws.cell(r, c).value) in aliases or clean_param(ws.cell(r, c).value) in {
+                    "prsv-fltr-source-ip6-address",
+                    "prsv-fltr-source-ip6-prefix-length",
+                }:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        rec: Dict[str, Any] = {}
+        ip4_raw = None
+        mask4_raw = None
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            if param not in aliases and param not in {
+                "prsv-fltr-source-ip6-address",
+                "prsv-fltr-source-ip6-prefix-length",
+            }:
+                continue
+
+            raw_value = None
+            for c in range(param_col + 1, min(scan_column_limit(ws), 24) + 1):
+                candidate = ws.cell(r, c).value
+                # Stop before duplicated Current Values parameter names.
+                if clean_param(candidate) in aliases or clean_param(candidate) in {
+                    "prsv-fltr-source-ip6-address",
+                    "prsv-fltr-source-ip6-prefix-length",
+                }:
+                    break
+                if is_status(candidate):
+                    continue
+                # Preserve intentional blank target values.
+                if candidate is None:
+                    continue
+                raw_value = candidate
+                break
+
+            # For rows like SPS where target is blank and comparison marker is 🗙,
+            # leave the field absent rather than borrowing Current Values.
+            if raw_value is None:
+                continue
+
+            if param == "prsv-fltr-source-ip4-address":
+                cleaned = clean_cell_value(raw_value)
+                if cleaned not in {None, ""}:
+                    ip4_raw = raw_value
+                continue
+
+            if param == "prsv-fltr-source-ip4-subnet-mask":
+                cleaned = clean_cell_value(raw_value)
+                if cleaned not in {None, ""}:
+                    mask4_raw = raw_value
+                continue
+
+            # IPv6 source fields are not represented in this CLI template.
+            if param in {
+                "prsv-fltr-source-ip6-address",
+                "prsv-fltr-source-ip6-prefix-length",
+            }:
+                continue
+
+            cleaned = clean_cell_value(raw_value)
+            if cleaned is None:
+                continue
+            rec[param] = raw_value
+
+        if "ddn-prsv-fltr-id" not in rec:
+            continue
+
+        id_clean = clean_cell_value(rec["ddn-prsv-fltr-id"])
+        if id_clean in {None, ""}:
+            continue
+
+        # Combine IPv4 address + subnet mask into one CLI IP value.
+        if ip4_raw is not None:
+            ip_clean = clean_cell_value(ip4_raw)
+            mask_clean = clean_cell_value(mask4_raw) if mask4_raw is not None else None
+            if ip_clean not in {None, ""}:
+                # Strip pasted wrapping quotes/newlines from the address.
+                ip_text = re.sub(r"\s+", "", as_text(ip_clean).strip().strip('"').strip("'"))
+                if mask_clean not in {None, ""}:
+                    mask_text = as_text(mask_clean).strip()
+                    rec["__ddnsip_combined_ip__"] = f"{ip_text}/{mask_text}"
+                else:
+                    rec["__ddnsip_combined_ip__"] = ip_text
+
+        records.append(rec)
+
+    return records
+
+
+def extract_urr_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract URR-INF vertical Target Values blocks only.
+
+    This prevents parameter/header names from leaking into output as fake IDs.
+    Valid target blocks are parsed even when comparison markers are 🗙.
+    """
+    if section.command.upper() != "CRTE-URR":
+        return []
+
+    aliases = {
+        "usage-reporting-rule-id": "ID",
+        "usage-reporting-rule-identifier": "URRID",
+        "purpose": "PURPOSE",
+        "measure-method": "MEAS",
+        "reporting-trigger": "RPT",
+        "measure-period": "PERIOD",
+        "inactivate-time": "INACT",
+        "linked-usage-reporting-rule-id": "LINK",
+        "volume-threshold": "THVOL",
+        "threshold-time": "THTIME",
+        "volume-quota": "QUVOL",
+        "time-quota": "QUTIME",
+        "quota-holding-time": "QUQHT",
+        "minimum-volume": "MINVOL",
+        "usage-reporting-rule-description": "DESC",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    param_table_end = find_parameter_table_end(ws, section, next_cli_row)
+    markers = find_target_markers(ws, param_table_end + 1, next_cli_row - 1)
+    records: List[Dict[str, Any]] = []
+
+    for marker_row, marker_col in markers:
+        end_row = _region_end_row(ws, marker_row, next_cli_row)
+
+        param_col = None
+        best_count = 0
+        for c in range(1, min(scan_column_limit(ws), 24) + 1):
+            count = 0
+            for r in range(marker_row + 1, min(end_row, marker_row + 40) + 1):
+                if clean_param(ws.cell(r, c).value) in aliases:
+                    count += 1
+            if count > best_count:
+                best_count = count
+                param_col = c
+
+        if param_col is None or best_count < 2:
+            continue
+
+        rec: Dict[str, Any] = {}
+
+        for r in range(marker_row + 1, end_row + 1):
+            param = clean_param(ws.cell(r, param_col).value)
+            if param not in aliases:
+                continue
+
+            raw_value = None
+            for c in range(param_col + 1, min(scan_column_limit(ws), 24) + 1):
+                candidate = ws.cell(r, c).value
+                if clean_param(candidate) in aliases:
+                    break
+                if is_blank(candidate) or is_status(candidate):
+                    continue
+                raw_value = candidate
+                break
+
+            if raw_value is None:
+                continue
+            if clean_cell_value(raw_value) is None:
+                continue
+            rec[param] = raw_value
+
+        if "usage-reporting-rule-id" not in rec or "usage-reporting-rule-identifier" not in rec:
+            continue
+
+        id_clean = clean_cell_value(rec["usage-reporting-rule-id"])
+        urrid_clean = clean_cell_value(rec["usage-reporting-rule-identifier"])
+        if id_clean in {None, ""} or urrid_clean in {None, ""}:
+            continue
+
+        if clean_param(id_clean) in aliases or clean_param(urrid_clean) in aliases:
+            continue
+
+        records.append(rec)
+
+    return records
 
 
 def extract_pdr_inf_records(
@@ -5130,6 +5398,18 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         epc_records = extract_epc_snssai_records(wb_values, section, sections)
         if epc_records:
             return epc_records
+
+    if section.command.upper() == "CRTE-DDNSIP-FLTR":
+        ddn_records = extract_ddnsip_fltr_records(wb_values, section, sections)
+        if ddn_records:
+            return ddn_records
+        return []
+
+    if section.command.upper() == "CRTE-URR":
+        urr_records = extract_urr_records(wb_values, section, sections)
+        if urr_records:
+            return urr_records
+        return []
 
     if section.command.upper() == "CRTE-PDR":
         pdr_inf_records = extract_pdr_inf_records(wb_values, section, sections)
