@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.176.0"
+SCRIPT_VERSION = "2.179.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -328,18 +328,43 @@ def normalize_ne_type(value: str) -> str:
 
 
 def quote_if_needed(value: str) -> str:
-    """Wrap TL1 values containing whitespace in double quotes.
+    """Quote TL1 string/list values when required.
 
-    Example: NAME=Lab TOR UDM -> NAME="Lab TOR UDM".
-    Existing quotes are preserved. Blank values are not quoted.
+    Quotes are added when the complete value is:
+      - an IPv4 address, e.g. 10.20.30.40
+      - an IPv4 address with port, e.g. 10.20.30.40:8080
+      - an ampersand-separated list, e.g. A&B&C
+      - any value containing whitespace
+
+    Existing surrounding double quotes are preserved so values are never
+    double-quoted.
     """
     if value == "":
         return value
-    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
-        return value
-    if any(ch.isspace() for ch in value):
-        return f'"{value}"'
-    return value
+
+    text = as_text(value).strip()
+
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        return text
+
+    # Exact IPv4 or IPv4:port. Keep prefix notation such as 10.0.0.0/8
+    # unchanged unless another rule requires quoting.
+    ipv4 = r"(?:\d{1,3}\.){3}\d{1,3}"
+    if re.fullmatch(ipv4, text):
+        return f'"{text}"'
+    if re.fullmatch(ipv4 + r":\d+", text):
+        return f'"{text}"'
+
+    # Ampersand-separated list of ordinary TL1 tokens.
+    # Examples: A&B&C, 1&2, host1.example&host2.example
+    if re.fullmatch(r"[A-Za-z0-9_.:'-]+(?:&[A-Za-z0-9_.:'-]+)+", text):
+        return f'"{text}"'
+
+    if any(ch.isspace() for ch in text):
+        return f'"{text}"'
+
+    return text
+
 
 
 def normalize_rtalidx_value(value: str) -> str:
@@ -536,6 +561,10 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
+
+    # Preserve PLMN identifiers exactly, including MNC leading zeros.
+    if cmd == "CRTE-MMEPLMN" and cli in {"MCC", "MNC", "PRILAPLMN", "SNDLAPLMN"}:
+        return quote_if_needed(as_text(value).strip())
 
     # DNS_HOST_NAME is case-sensitive source text. Preserve it exactly and
     # only apply the normal quoting rule when whitespace is present.
@@ -2391,6 +2420,162 @@ def extract_epc_snssai_records(
 
 
 
+
+def extract_mmeplmn_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract MMEPLMN-INF rows from the referenced MME PLMN Policies sheet."""
+
+    if section.command.upper() != "CRTE-MMEPLMN":
+        return []
+
+    aliases = {
+        "plmn-inf-snet": "SNET",
+        "plmn-inf-mcc": "MCC",
+        "plmn-inf-mnc": "MNC",
+        "plmn-inf-vrfsp": "VRFSP",
+        "plmn-inf-eplmn": "EPLMN",
+        "plmn-inf-forbta": "FORBTA",
+        "plmn-inf-forbla": "FORBLA",
+        "plmn-inf-rqos": "RQOS",
+        "plmn-inf-ims": "IMS",
+        "plmn-inf-emg": "EMG",
+        "plmn-inf-dcn_mmeg": "DCN_MMEG",
+        "plmn-inf-nepsidx": "NEPSIDX",
+        "plmn-inf-dcnr": "DCNR",
+        "plmn-inf-srur": "SRUR",
+        "plmn-inf-override": "OVERRIDE",
+        "plmn-inf-usage": "USAGE",
+        "plmn-inf-feat2": "FEAT2",
+        "plmn-inf-sgwrestoration": "SGWRST",
+        "plmn-inf-nrrestriction": "NRRSTR",
+        "plmn-inf-defaultapnindex": "DAPNIDX",
+        "plmn-inf-ratrestirctioncause": "RATRSTRC",
+        "plmn-inf-ratrestrictioncause": "RATRSTRC",
+        "plmn-inf-primarylaplmn": "PRILAPLMN",
+        "plmn-inf-secondarylaplmn": "SNDLAPLMN",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    referred_sheet_name = resolve_referred_sheet(wb_values, referred) if referred else None
+    if not referred_sheet_name:
+        return []
+
+    ref_ws = wb_values[referred_sheet_name]
+
+    marker_row = None
+    for r in range(1, min(ref_ws.max_row, 20) + 1):
+        for c in range(1, min(scan_column_limit(ref_ws), 20) + 1):
+            if TARGET_RE.search(as_text(ref_ws.cell(r, c).value)):
+                marker_row = r
+                break
+        if marker_row is not None:
+            break
+    if marker_row is None:
+        return []
+
+    header_row = None
+    param_cols: Dict[int, str] = {}
+
+    for r in range(marker_row + 1, min(ref_ws.max_row, marker_row + 5) + 1):
+        found: Dict[int, str] = {}
+        seen_snet = False
+
+        for c in range(1, scan_column_limit(ref_ws) + 1):
+            p = clean_param(ref_ws.cell(r, c).value).lower()
+
+            if p == "plmn-inf-snet":
+                if seen_snet:
+                    break
+                seen_snet = True
+
+            if p in aliases:
+                found[c] = p
+            elif p in {"plmn-inf-vpln-addr", "plmn-inf-vplmn-addr"}:
+                continue
+
+        if all(req in found.values() for req in (
+            "plmn-inf-snet", "plmn-inf-mcc", "plmn-inf-mnc"
+        )):
+            header_row = r
+            param_cols = found
+            break
+
+    if header_row is None:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    blank_run = 0
+
+    for r in range(header_row + 1, ref_ws.max_row + 1):
+        rec: Dict[str, Any] = {}
+        has_any = False
+
+        for c, param in param_cols.items():
+            raw = ref_ws.cell(r, c).value
+            if not is_blank(raw):
+                has_any = True
+            if is_struck_value(raw):
+                continue
+
+            # EPLMN=[default = none] is not an explicit configuration value
+            # for this source and should remain omitted.
+            if param == "plmn-inf-eplmn":
+                default_val = extract_default_value(as_text(raw))
+                if default_val is not None and norm_key(default_val) == "none":
+                    continue
+
+            cleaned = clean_cell_value(raw)
+            if cleaned is None:
+                continue
+            rec[param] = raw
+
+        if not has_any:
+            blank_run += 1
+            if blank_run >= 2:
+                break
+            continue
+        blank_run = 0
+
+        if any(k not in rec for k in (
+            "plmn-inf-snet", "plmn-inf-mcc", "plmn-inf-mnc"
+        )):
+            continue
+
+        snet = clean_cell_value(rec["plmn-inf-snet"])
+        mcc = clean_cell_value(rec["plmn-inf-mcc"])
+        mnc = clean_cell_value(rec["plmn-inf-mnc"])
+
+        if any(v in {None, ""} for v in (snet, mcc, mnc)):
+            continue
+
+        snet_s = as_text(snet).strip()
+        mcc_s = as_text(mcc).strip()
+        mnc_s = as_text(mnc).strip()
+
+        if not re.fullmatch(r"\d{1,2}", snet_s):
+            continue
+        if not re.fullmatch(r"\d{3}", mcc_s):
+            continue
+        if not re.fullmatch(r"\d{1,3}", mnc_s):
+            continue
+
+        records.append(rec)
+
+    return records
+
+
 def extract_ddnsip_fltr_records(
     wb_values,
     section: Section,
@@ -4075,6 +4260,7 @@ def extract_ne_grp_records(
         return []
 
     aliases = {
+        # Generic NE-GRP family.
         "ne-group-type": "NE",
         "ne-group-id": "GID",
         "ne-group-name": "GNAME",
@@ -4086,9 +4272,24 @@ def extract_ne_grp_records(
         "ne-group-elem-entry/ne-group-ne-id": "NEID",
         "ne-group-elem-entry/ne-group-pri": "PRI",
         "ne-group-elem-entry/ne-group-capa": "CAPA",
+
+        # MME/AMF NE-GRP family.
+        "amfmme-ne-grp-type": "NE",
+        "amfmme-ne-grp-id": "GID",
+        "amfmme-ne-grp-name": "GNAME",
+        "amfmme-ne-grp-bkup-grp-id": "BKUPGID",
+        "amfmme-ne-grp-sel-mth": "SELM",
+        "amfmme-ne-grp-intf-dir": "IFDIR",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-ne-id": "NEID",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-pri": "PRI",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-capa": "CAPA",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-roam": "ROAM",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-rcapa": "RCAPA",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-ecr": "ECR",
+        "amfmme-ne-grp-elem-entry/amfmme-ne-grp-intv": "INTV",
     }
-    parent_cli = {"NE", "GID", "GNAME", "BKUPGID", "SELM", "TMR", "MAXCHG", "AF"}
-    child_cli = {"NEID", "PRI", "CAPA"}
+    parent_cli = {"NE", "GID", "GNAME", "BKUPGID", "SELM", "TMR", "MAXCHG", "AF", "IFDIR"}
+    child_cli = {"NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"}
 
     all_records: List[Dict[str, Any]] = []
 
@@ -5399,6 +5600,12 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         if epc_records:
             return epc_records
 
+    if section.command.upper() == "CRTE-MMEPLMN":
+        mmeplmn_records = extract_mmeplmn_records(wb_values, section, sections)
+        if mmeplmn_records:
+            return mmeplmn_records
+        return []
+
     if section.command.upper() == "CRTE-DDNSIP-FLTR":
         ddn_records = extract_ddnsip_fltr_records(wb_values, section, sections)
         if ddn_records:
@@ -6442,7 +6649,7 @@ def records_to_ne_grp_tl1(section: Section, records: List[Dict[str, Any]]) -> Li
     crte_order = [x for x in section.cli_order if x in parent_fields + child_fields]
     if not crte_order:
         crte_order = [
-            "NE", "GID", "GNAME", "BKUPGID", "SELM", "TMR", "MAXCHG", "AF",
+            "NE", "GID", "GNAME", "BKUPGID", "SELM", "IFDIR", "TMR", "MAXCHG", "AF",
             "NEID", "PRI", "CAPA", "ROAM", "RCAPA", "ECR", "INTV"
         ]
 
