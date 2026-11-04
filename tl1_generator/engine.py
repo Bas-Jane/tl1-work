@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.179.0"
+SCRIPT_VERSION = "2.182.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -347,12 +347,17 @@ def quote_if_needed(value: str) -> str:
     if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
         return text
 
-    # Exact IPv4 or IPv4:port. Keep prefix notation such as 10.0.0.0/8
-    # unchanged unless another rule requires quoting.
+    # Exact IPv4, IPv4:port, or IPv4/prefix values are quoted.
+    # Examples:
+    #   10.20.30.40      -> "10.20.30.40"
+    #   10.20.30.40:8080 -> "10.20.30.40:8080"
+    #   10.20.30.0/24    -> "10.20.30.0/24"
     ipv4 = r"(?:\d{1,3}\.){3}\d{1,3}"
     if re.fullmatch(ipv4, text):
         return f'"{text}"'
     if re.fullmatch(ipv4 + r":\d+", text):
+        return f'"{text}"'
+    if re.fullmatch(ipv4 + r"/\d{1,3}", text):
         return f'"{text}"'
 
     # Ampersand-separated list of ordinary TL1 tokens.
@@ -561,6 +566,20 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
+
+    # Tracking-area identifiers preserve source digit strings, while TAC/LAC
+    # hexadecimal values are normalized to uppercase.
+    if cmd == "CRTE-MMETA" and cli in {"MCC", "MNC", "LAMCC", "LAMNC"}:
+        return quote_if_needed(as_text(value).strip())
+    if cmd == "CRTE-MMETA" and cli in {"TAC", "LAC"}:
+        raw = as_text(value).strip()
+        if re.fullmatch(r"(?i)h'[0-9a-f]+", raw):
+            return "H'" + raw[2:].upper()
+        return quote_if_needed(raw.upper())
+
+    # IMSI prefix is a digit string. Preserve it exactly, including leading zeros.
+    if cmd == "CRTE-IMSI-PFX" and cli == "PFX":
+        return quote_if_needed(as_text(value).strip())
 
     # Preserve PLMN identifiers exactly, including MNC leading zeros.
     if cmd == "CRTE-MMEPLMN" and cli in {"MCC", "MNC", "PRILAPLMN", "SNDLAPLMN"}:
@@ -2419,6 +2438,299 @@ def extract_epc_snssai_records(
 
 
 
+
+
+
+
+def extract_mmeta_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract Tracking Area records from the referenced MME Tracking Areas sheet.
+
+    The source is a horizontal target/current table. Only target-side columns
+    are consumed; duplicated Current Values columns are ignored.
+    """
+    if section.command.upper() != "CRTE-MMETA":
+        return []
+
+    aliases = {
+        "ta-inf-mcc": "MCC",
+        "ta-inf-mnc": "MNC",
+        "ta-inf-tac": "TAC",
+        "ta-inf-tal": "TAL",
+        "ta-inf-sgwgrp": "SGWGRP",
+        "ta-inf-esmlcgrp": "ESMLCGRP",
+        "ta-inf-gwugrp": "GWUGRP",
+        "ta-inf-desc": "DESC",
+        "ta-inf-static": "STATIC",
+        "ta-inf-ims": "IMS",
+        "ta-inf-emg": "EMG",
+        "ta-inf-la-entry/ta-inf-la-lmcc": "LAMCC",
+        "ta-inf-la-entry/ta-inf-la-lmnc": "LAMNC",
+        "ta-inf-la-entry/ta-inf-la-lac": "LAC",
+        "ta-inf-ftal-entry/ta-inf-ftal": "FTAL",
+    }
+
+    for param, cli in aliases.items():
+        section.param_to_cli[param] = cli
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    referred_sheet_name = resolve_referred_sheet(wb_values, referred) if referred else None
+    if not referred_sheet_name:
+        return []
+
+    ref_ws = wb_values[referred_sheet_name]
+
+    # Locate actual Target Values marker.
+    marker_row = None
+    for r in range(1, min(ref_ws.max_row, 30) + 1):
+        for c in range(1, min(scan_column_limit(ref_ws), 50) + 1):
+            if TARGET_RE.search(as_text(ref_ws.cell(r, c).value)):
+                marker_row = r
+                break
+        if marker_row is not None:
+            break
+    if marker_row is None:
+        return []
+
+    # Horizontal parameter header; stop at second ta-inf-mcc occurrence,
+    # which starts duplicated Current Values.
+    header_row = None
+    param_cols: Dict[int, str] = {}
+
+    for r in range(marker_row + 1, min(ref_ws.max_row, marker_row + 5) + 1):
+        found: Dict[int, str] = {}
+        seen_mcc = False
+
+        for c in range(1, scan_column_limit(ref_ws) + 1):
+            p = clean_param(ref_ws.cell(r, c).value).lower()
+
+            if p == "ta-inf-mcc":
+                if seen_mcc:
+                    break
+                seen_mcc = True
+
+            if p in aliases:
+                found[c] = p
+
+        required = {"ta-inf-mcc", "ta-inf-mnc", "ta-inf-tac"}
+        if required.issubset(set(found.values())):
+            header_row = r
+            param_cols = found
+            break
+
+    if header_row is None:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    blank_run = 0
+
+    for r in range(header_row + 1, ref_ws.max_row + 1):
+        rec: Dict[str, Any] = {}
+        row_has_target = False
+
+        for c, param in param_cols.items():
+            raw = ref_ws.cell(r, c).value
+            if not is_blank(raw):
+                row_has_target = True
+            if is_struck_value(raw):
+                continue
+
+            cleaned = clean_cell_value(raw)
+            if cleaned is None:
+                continue
+
+            rec[param] = raw
+
+        if not row_has_target:
+            blank_run += 1
+            if blank_run >= 2:
+                break
+            continue
+        blank_run = 0
+
+        # Require valid MCC/MNC/TAC triplet.
+        if any(k not in rec for k in ("ta-inf-mcc", "ta-inf-mnc", "ta-inf-tac")):
+            continue
+
+        mcc = clean_cell_value(rec["ta-inf-mcc"])
+        mnc = clean_cell_value(rec["ta-inf-mnc"])
+        tac = clean_cell_value(rec["ta-inf-tac"])
+        if any(v in {None, ""} for v in (mcc, mnc, tac)):
+            continue
+
+        mcc_s = as_text(mcc).strip()
+        mnc_s = as_text(mnc).strip()
+        tac_s = as_text(tac).strip()
+
+        if not re.fullmatch(r"\d{3}", mcc_s):
+            continue
+        if not re.fullmatch(r"\d{2,3}", mnc_s):
+            continue
+        if not (
+            re.fullmatch(r"(?i)h'[0-9a-f]{1,4}", tac_s)
+            or re.fullmatch(r"\d{1,5}", tac_s)
+        ):
+            continue
+
+        records.append(rec)
+
+    return records
+
+
+def extract_imsi_pfx_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Extract IMSI Prefix entries from the referenced IMSI Prefixes sheet.
+
+    The referred sheet is horizontal and may contain a leading notes/comments
+    column plus duplicated current-value columns after the target-side block.
+    Only the target-side parameter block is consumed.
+    """
+    if section.command.upper() != "CRTE-IMSI-PFX":
+        return []
+
+    aliases = {
+        "amfmme-imsi-prefix-val": "PFX",
+        "amfmme-imsi-prefix-name": "NAME",
+        "amfmme-imsi-prefix-udmgrp": "UDMGRP",
+        "amfmme-imsi-prefix-ausfgrp": "AUSFGRP",
+        "amfmme-imsi-prefix-authprof": "AUTHPROF",
+        "amfmme-imsi-prefix-blkamf": "BLKAMF",
+        "amfmme-imsi-prefix-hssgrp": "HSSGRP",
+        "amfmme-imsi-prefix-pgw": "PGW",
+        "amfmme-imsi-prefix-auth-index": "AUTHIDX",
+        "amfmme-imsi-prefix-dcn-mmeg": "DCN_MMEG",
+        "amfmme-imsi-prefix-block-mme": "BLOCK_MME",
+        "amfmme-imsi-prefix-deirgrp": "DEIRGRP",
+        "amfmme-imsi-prefix-eirfhpf": "EIRFHPF",
+    }
+
+    # Register all fields, including 26A EIRFHPF even when older CLI templates
+    # omit it from the parameter-definition table.
+    for param, cli in aliases.items():
+        section.param_to_cli[param] = cli
+
+    # Extend command ordering only when EIRFHPF exists in the source and is not
+    # already present in the parsed CLI order.
+    if "EIRFHPF" not in {x.upper() for x in section.cli_order}:
+        section.cli_order.append("EIRFHPF")
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections
+         if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    referred_sheet_name = resolve_referred_sheet(wb_values, referred) if referred else None
+    if not referred_sheet_name:
+        return []
+
+    ref_ws = wb_values[referred_sheet_name]
+
+    # Find the real Target Values marker near the top of the referred sheet.
+    marker_row = None
+    for r in range(1, min(ref_ws.max_row, 30) + 1):
+        for c in range(1, min(scan_column_limit(ref_ws), 40) + 1):
+            if TARGET_RE.search(as_text(ref_ws.cell(r, c).value)):
+                marker_row = r
+                break
+        if marker_row is not None:
+            break
+    if marker_row is None:
+        return []
+
+    # Find the horizontal parameter header. Stop at the second occurrence of
+    # the PFX header, which marks the duplicated Current Values side.
+    header_row = None
+    param_cols: Dict[int, str] = {}
+
+    for r in range(marker_row + 1, min(ref_ws.max_row, marker_row + 5) + 1):
+        found: Dict[int, str] = {}
+        seen_pfx = False
+
+        for c in range(1, scan_column_limit(ref_ws) + 1):
+            p = clean_param(ref_ws.cell(r, c).value).lower()
+
+            if p == "amfmme-imsi-prefix-val":
+                if seen_pfx:
+                    break
+                seen_pfx = True
+
+            if p in aliases:
+                found[c] = p
+
+        if "amfmme-imsi-prefix-val" in found.values():
+            header_row = r
+            param_cols = found
+            break
+
+    if header_row is None:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    blank_run = 0
+
+    for r in range(header_row + 1, ref_ws.max_row + 1):
+        raw_pfx = None
+        pfx_col = None
+        for c, param in param_cols.items():
+            if param == "amfmme-imsi-prefix-val":
+                pfx_col = c
+                raw_pfx = ref_ws.cell(r, c).value
+                break
+
+        # Ignore note/comment rows and unrelated trailing material unless a
+        # valid 1-15 digit IMSI prefix is present in the actual PFX column.
+        cleaned_pfx = clean_cell_value(raw_pfx)
+        if cleaned_pfx in {None, ""}:
+            row_has_target_content = any(
+                not is_blank(ref_ws.cell(r, c).value)
+                for c in param_cols
+            )
+            if not row_has_target_content:
+                blank_run += 1
+                if blank_run >= 2:
+                    break
+            continue
+
+        pfx = as_text(cleaned_pfx).strip()
+        if not re.fullmatch(r"\d{1,15}", pfx):
+            continue
+
+        blank_run = 0
+        rec: Dict[str, Any] = {}
+
+        for c, param in param_cols.items():
+            raw = ref_ws.cell(r, c).value
+            if is_struck_value(raw):
+                continue
+
+            cleaned = clean_cell_value(raw)
+            if cleaned is None:
+                continue
+
+            rec[param] = raw
+
+        if "amfmme-imsi-prefix-val" not in rec:
+            continue
+
+        records.append(rec)
+
+    return records
 
 
 def extract_mmeplmn_records(
@@ -5599,6 +5911,18 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         epc_records = extract_epc_snssai_records(wb_values, section, sections)
         if epc_records:
             return epc_records
+
+    if section.command.upper() == "CRTE-MMETA":
+        mmeta_records = extract_mmeta_records(wb_values, section, sections)
+        if mmeta_records:
+            return mmeta_records
+        return []
+
+    if section.command.upper() == "CRTE-IMSI-PFX":
+        imsi_pfx_records = extract_imsi_pfx_records(wb_values, section, sections)
+        if imsi_pfx_records:
+            return imsi_pfx_records
+        return []
 
     if section.command.upper() == "CRTE-MMEPLMN":
         mmeplmn_records = extract_mmeplmn_records(wb_values, section, sections)
