@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.186.0"
+SCRIPT_VERSION = "2.187.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -566,6 +566,20 @@ def format_tl1_value(cli_name: str, value: str, command: str = "") -> str:
 
     cli = (cli_name or "").strip().upper()
     cmd = (command or "").strip().upper()
+
+    # MMEIMSI range values: preserve exact IMSI/MCC/MNC digit strings and normalize TAC hex.
+    if cmd in {"CRTE-MMEIMSI-RANGE", "CHG-MMEIMSI-RANGE"} and cli in {
+        "SIMSI", "EIMSI", "IMSMCC", "IMSMNC", "EMGMCC", "EMGMNC",
+        "DCNRMCC", "DCNRMNC", "EPLMNMCC", "EPLMNMNC"
+    }:
+        return quote_if_needed(as_text(value).strip())
+    if cmd in {"CRTE-MMEIMSI-RANGE", "CHG-MMEIMSI-RANGE"} and cli in {
+        "IMSTAC", "EMGTAC", "DCNRTAC", "EPLMNTAC"
+    }:
+        raw = as_text(value).strip()
+        if re.fullmatch(r"(?i)h'[0-9a-f]+", raw):
+            return "H'" + raw[2:].upper()
+        return quote_if_needed(raw.upper())
 
     # Tracking-area identifiers preserve source digit strings, while TAC/LAC
     # hexadecimal values are normalized to uppercase.
@@ -2441,6 +2455,155 @@ def extract_epc_snssai_records(
 
 
 
+
+
+
+def extract_mmeimsi_range_records(
+    wb_values,
+    section: Section,
+    sections: List[Section],
+) -> List[Dict[str, Any]]:
+    """Parse the referred MMEIMSI Ranges target table."""
+    if section.command.upper() != "CRTE-MMEIMSI-RANGE":
+        return []
+
+    aliases = {
+        "mme-imsi-range-id": "ID",
+        "mme-imsi-range-startimsi": "SIMSI",
+        "mme-imsi-range-endimsi": "EIMSI",
+        "mme-imsi-range-ims-supp": "IMS",
+        "mme-imsi-range-emg-supp": "EMG",
+        "mme-imsi-range-dcnr-restrict": "DCNR_RSTR",
+        "mme-imsi-range-eplmn-mod": "EPLMN",
+        "mme-imsi-range-imsta-entry/mme-imsi-range-imsta-mcc": "IMSMCC",
+        "mme-imsi-range-imsta-entry/mme-imsi-range-imsta-mnc": "IMSMNC",
+        "mme-imsi-range-imsta-entry/mme-imsi-range-imsta-tac": "IMSTAC",
+        "mme-imsi-range-emgta-entry/mme-imsi-range-emgta-mcc": "EMGMCC",
+        "mme-imsi-range-emgta-entry/mme-imsi-range-emgta-mnc": "EMGMNC",
+        "mme-imsi-range-emgta-entry/mme-imsi-range-emgta-tac": "EMGTAC",
+        "mme-imsi-range-dcnrta-entry/mme-imsi-range-dcnr-mcc": "DCNRMCC",
+        "mme-imsi-range-dcnrta-entry/mme-imsi-range-dcnr-mnc": "DCNRMNC",
+        "mme-imsi-range-dcnrta-entry/mme-imsi-range-dcnr-tac": "DCNRTAC",
+        "mme-imsi-range-eplmnta-entry/mme-imsi-range-eplmnta-mcc": "EPLMNMCC",
+        "mme-imsi-range-eplmnta-entry/mme-imsi-range-eplmnta-mnc": "EPLMNMNC",
+        "mme-imsi-range-eplmnta-entry/mme-imsi-range-eplmnta-tac": "EPLMNTAC",
+        "mme-imsi-range-eplmnta-entry/mme-imsi-range-eplmnta-incl": "INCL_EPLMN",
+        "mme-imsi-range-eplmnta-entry/mme-imsi-range-eplmnta-excl": "EXCL_EPLMN",
+    }
+    for p, cli in aliases.items():
+        section.param_to_cli[p] = cli
+
+    ws = wb_values[section.sheet_name]
+    next_cli_row = min(
+        [s.cli_row for s in sections if s.sheet_name == section.sheet_name and s.cli_row > section.cli_row]
+        or [ws.max_row + 1]
+    )
+    referred = find_referred_sheet_name(ws, section.cli_row, next_cli_row - 1)
+    ref_name = resolve_referred_sheet(wb_values, referred) if referred else None
+    if not ref_name:
+        return []
+    ref_ws = wb_values[ref_name]
+
+    marker_row = None
+    for r in range(1, min(ref_ws.max_row, 30) + 1):
+        for c in range(1, min(scan_column_limit(ref_ws), 80) + 1):
+            if TARGET_RE.search(as_text(ref_ws.cell(r, c).value)):
+                marker_row = r
+                break
+        if marker_row is not None:
+            break
+    if marker_row is None:
+        return []
+
+    header_row = None
+    param_cols: Dict[int, str] = {}
+    for r in range(marker_row + 1, min(ref_ws.max_row, marker_row + 5) + 1):
+        found: Dict[int, str] = {}
+        seen_id = False
+        for c in range(1, scan_column_limit(ref_ws) + 1):
+            p = clean_param(ref_ws.cell(r, c).value).lower()
+            if p == "mme-imsi-range-id":
+                if seen_id:
+                    break
+                seen_id = True
+            if p in aliases:
+                found[c] = p
+        if {"mme-imsi-range-id", "mme-imsi-range-startimsi", "mme-imsi-range-endimsi"}.issubset(set(found.values())):
+            header_row = r
+            param_cols = found
+            break
+    if header_row is None:
+        return []
+
+    parent_params = {
+        "mme-imsi-range-id", "mme-imsi-range-startimsi", "mme-imsi-range-endimsi",
+        "mme-imsi-range-ims-supp", "mme-imsi-range-emg-supp",
+        "mme-imsi-range-dcnr-restrict", "mme-imsi-range-eplmn-mod",
+    }
+    inherited_parent: Dict[str, Any] = {}
+    records: List[Dict[str, Any]] = []
+    blank_run = 0
+
+    for r in range(header_row + 1, ref_ws.max_row + 1):
+        rec: Dict[str, Any] = {}
+        new_parent = False
+        explicit_child = False
+        row_has_content = False
+
+        for c, param in param_cols.items():
+            raw = ref_ws.cell(r, c).value
+            if not is_blank(raw):
+                row_has_content = True
+
+            if param in parent_params:
+                if is_arrow_value(raw):
+                    if param in inherited_parent:
+                        rec[param] = inherited_parent[param]
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+                inherited_parent[param] = raw
+                if param == "mme-imsi-range-id":
+                    new_parent = True
+            else:
+                # Child continuation arrows mean "same parent context, no new child value".
+                if is_arrow_value(raw) or is_struck_value(raw):
+                    continue
+                cleaned = clean_cell_value(raw)
+                if cleaned is None:
+                    continue
+                rec[param] = raw
+                explicit_child = True
+
+        if not row_has_content:
+            blank_run += 1
+            if blank_run >= 25:
+                break
+            continue
+        blank_run = 0
+
+        rid = clean_cell_value(rec.get("mme-imsi-range-id"))
+        if rid is None or not re.fullmatch(r"\d{1,4}", as_text(rid).strip()):
+            continue
+
+        if new_parent:
+            simsi = clean_cell_value(rec.get("mme-imsi-range-startimsi"))
+            eimsi = clean_cell_value(rec.get("mme-imsi-range-endimsi"))
+            if simsi is None or eimsi is None:
+                continue
+            if not re.fullmatch(r"\d{15}", as_text(simsi).strip()):
+                continue
+            if not re.fullmatch(r"\d{15}", as_text(eimsi).strip()):
+                continue
+            rec["__MMEIMSI_NEW_PARENT__"] = True
+            records.append(rec)
+        elif explicit_child:
+            rec["__MMEIMSI_NEW_PARENT__"] = False
+            records.append(rec)
+
+    return records
 
 
 def extract_mmeta_records(
@@ -5913,6 +6076,12 @@ def extract_target_records_for_section(wb_values, section: Section, sections: Li
         if epc_records:
             return epc_records
 
+    if section.command.upper() == "CRTE-MMEIMSI-RANGE":
+        mmeimsi_records = extract_mmeimsi_range_records(wb_values, section, sections)
+        if mmeimsi_records:
+            return mmeimsi_records
+        return []
+
     if section.command.upper() == "CRTE-MMETA":
         mmeta_records = extract_mmeta_records(wb_values, section, sections)
         if mmeta_records:
@@ -6957,6 +7126,55 @@ def records_to_ni_pf_tl1(section: Section, records: List[Dict[str, Any]]) -> Lis
     return lines
 
 
+
+def records_to_mmeimsi_range_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
+    """Render one CRTE per parent range and MODE=ADD for child continuation rows."""
+    if section.command.upper() != "CRTE-MMEIMSI-RANGE":
+        return []
+
+    create_order = [
+        "ID", "SIMSI", "EIMSI", "IMS", "EMG", "DCNR_RSTR", "EPLMN",
+        "IMSMCC", "IMSMNC", "IMSTAC", "EMGMCC", "EMGMNC", "EMGTAC",
+        "DCNRMCC", "DCNRMNC", "DCNRTAC",
+        "EPLMNMCC", "EPLMNMNC", "EPLMNTAC", "INCL_EPLMN", "EXCL_EPLMN",
+    ]
+    child_fields = create_order[7:]
+    lines: List[str] = []
+    current_id: Optional[str] = None
+
+    for rec in records:
+        vals = record_to_cli_values(section, rec, keep_arrows=False)
+        if not vals:
+            continue
+        if "ID" in vals:
+            current_id = vals["ID"]
+        if not current_id:
+            continue
+
+        if rec.get("__MMEIMSI_NEW_PARENT__"):
+            line = render_cli_line(
+                "CRTE-MMEIMSI-RANGE", create_order, vals,
+                required_order=create_order,
+            )
+            if line:
+                lines.append(line)
+            continue
+
+        child_vals = {k: vals[k] for k in child_fields if k in vals}
+        if not child_vals:
+            continue
+        chg_vals = {"ID": current_id, "MODE": "ADD", **child_vals}
+        chg_order = ["ID", "MODE"] + child_fields
+        line = render_cli_line(
+            "CHG-MMEIMSI-RANGE", chg_order, chg_vals,
+            required_order=chg_order,
+        )
+        if line:
+            lines.append(line)
+
+    return lines
+
+
 def records_to_ne_grp_tl1(section: Section, records: List[Dict[str, Any]]) -> List[str]:
     """Render NE-GRP with the first child member on CRTE and later members on CHG.
 
@@ -7538,6 +7756,8 @@ def build_tl1_output(wb_values, selected_sheets: Sequence[str], selected_section
             lines = records_to_gtpc_cause_tl1(section, records)
         elif section.param_fixed_cli_values:
             lines = records_to_conditioned_tl1(section, records)
+        elif section.command.upper() == "CRTE-MMEIMSI-RANGE":
+            lines = records_to_mmeimsi_range_tl1(section, records)
         elif section.command.upper() == "CRTE-NE-GRP":
             lines = records_to_ne_grp_tl1(section, records)
         elif section.command.upper() == "CRTE-MMERTAL":
