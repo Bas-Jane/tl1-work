@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.182.0"
+SCRIPT_VERSION = "2.184.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -1547,6 +1547,7 @@ def row_starts_documentation_block(ws_values, row: int, scan_cols: Optional[Sequ
         "call timer details",
         "license details",
         "timer details",
+        "design intent",
     )
     if any(marker in joined for marker in strong_markers):
         return True
@@ -6111,6 +6112,8 @@ def is_metadata_or_helper_value(value: Any) -> bool:
         "license details",
         "value range",
         "recommended",
+        "design intent",
+        "design intent:",
     }
     if low in exact_bad:
         return True
@@ -6127,6 +6130,7 @@ def is_metadata_or_helper_value(value: Any) -> bool:
         "call timer details",
         "license details",
         "details hidden",
+        "design intent",
     )
     if low.startswith(bad_prefixes):
         return True
@@ -7770,7 +7774,7 @@ def ask_output_path(default_stem: str) -> str:
     else:
         stem = default_stem
 
-    filename = f"{stem}_{VERSION_TAG}.tl1"
+    filename = f"{stem}.tl1"
     return str(Path(folder) / filename)
 
 def ask_sheet_selection(wb_values) -> List[str]:
