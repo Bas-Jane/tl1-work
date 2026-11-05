@@ -34,7 +34,7 @@ except ImportError:
 # -----------------------------
 # Configuration
 # -----------------------------
-SCRIPT_VERSION = "2.184.0"
+SCRIPT_VERSION = "2.186.0"
 VERSION_TAG = "v" + SCRIPT_VERSION.replace(".", "_")
 MAX_TL1_LINES_PER_FILE = 10000
 LARGE_SHEET_ROW_THRESHOLD = 100000
@@ -7683,38 +7683,65 @@ def split_text_by_max_lines(text: str, max_lines: int = MAX_TL1_LINES_PER_FILE) 
 
 
 
+def sanitize_output_stem(stem: str) -> str:
+    """Remove application/engine version suffixes but preserve timestamps.
+
+    Examples:
+      NRF_Full_Config_v2_185_0_20261104_210717 -> NRF_Full_Config_20261104_210717
+      NRF_Full_Config_v2.185.0_20261104_210717 -> NRF_Full_Config_20261104_210717
+      NRF_Full_Config_20261104_210717           -> NRF_Full_Config
+      NRF_Full_Config_v2_185_0                  -> NRF_Full_Config
+
+    A trailing timestamp is temporarily separated while removing a version
+    suffix. The final writer then appends the current run timestamp so every
+    generated filename has exactly one timestamp and no version.
+    """
+    s = as_text(stem).strip()
+    if not s:
+        return "ciq_tl1_output"
+
+    # Remove any existing trailing timestamp. The writer will add the run's
+    # timestamp back in a single, consistent location.
+    s = re.sub(r"_\d{8}_\d{6}(?:_\d{2})?$", "", s, flags=re.I)
+
+    # Remove application/engine version suffixes in underscore or dotted form.
+    s = re.sub(r"_v\d+(?:[._]\d+){2,}$", "", s, flags=re.I)
+
+    return s.rstrip(" _-.") or "ciq_tl1_output"
+
+
 def timestamped_run_output_path(output_path: str) -> Path:
-    """Return an output path inside a YYYYMMDD_HHMMSS run folder.
+    """Return an output path inside a timestamped run folder.
 
-    The caller supplies the desired parent directory and filename. This helper
-    guarantees that generation occurs inside a timestamped child folder:
+    Final filename convention:
+        <stem>_<YYYYMMDD_HHMMSS>.tl1
 
-        <selected-output-folder>/YYYYMMDD_HHMMSS/<filename>
-
-    If the supplied parent is already a timestamp run folder, it is reused.
-    This keeps CLI and GUI behavior identical and prevents accidental double
-    timestamp nesting.
+    Application/engine versions are removed from the stem. The timestamp is
+    retained in the output filename and also used for the run folder.
     """
     path = Path(output_path)
     parent = path.parent
+    clean_stem = sanitize_output_stem(path.stem)
 
-    if re.fullmatch(r"\d{8}_\d{6}", parent.name):
+    if re.fullmatch(r"\d{8}_\d{6}(?:_\d{2})?", parent.name):
         run_folder = parent
+        run_stamp = parent.name
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_folder = parent / timestamp
+        run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_folder = parent / run_stamp
 
-        # A second execution within the exact same second should not mix files.
+        # A second execution within the same second should not mix files.
         if run_folder.exists():
             suffix = 2
-            base = run_folder
+            base_stamp = run_stamp
             while run_folder.exists():
-                run_folder = parent / f"{base.name}_{suffix:02d}"
+                run_stamp = f"{base_stamp}_{suffix:02d}"
+                run_folder = parent / run_stamp
                 suffix += 1
 
     run_folder.mkdir(parents=True, exist_ok=True)
-    return run_folder / path.name
-
+    final_name = f"{clean_stem}_{run_stamp}{path.suffix}"
+    return run_folder / final_name
 
 
 def write_warnings_file(written_files: Sequence[str], warnings: Sequence[str]) -> Optional[str]:
@@ -7774,6 +7801,7 @@ def ask_output_path(default_stem: str) -> str:
     else:
         stem = default_stem
 
+    stem = sanitize_output_stem(stem)
     filename = f"{stem}.tl1"
     return str(Path(folder) / filename)
 
